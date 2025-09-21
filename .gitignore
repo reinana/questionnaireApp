@@ -1,0 +1,5 @@
+# Google Cloudの認証情報
+credentials.json
+frontend/config.js
+# Pythonのキャッシュファイル
+__pycache__/

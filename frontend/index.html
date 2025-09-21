@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="ja">
+    <head> </head>
+    <body>
+        <h1>アンケート画像アップローダー</h1>
+
+        <div id="auth-container">
+            <p id="user-info">ログインしていません</p>
+            <button id="login-button">Googleでログイン</button>
+            <button id="logout-button" style="display: none">ログアウト</button>
+        </div>
+        <hr />
+
+        <div id="settings-container" style="display: none">
+            <h3>設定</h3>
+            <form id="settings-form">
+                <label for="sheet-id-input"
+                    >書き込み先のGoogleスプレッドシートID:</label
+                >
+                <input
+                    type="text"
+                    id="sheet-id-input"
+                    size="50"
+                    placeholder="スプレッドシートのURLからIDをコピーしてください"
+                />
+                <button type="submit">保存</button>
+            </form>
+        </div>
+
+        <form id="upload-form" style="display: none">
+            <input type="file" id="file-input" accept="image/*" multiple />
+            <button type="submit">アップロード</button>
+        </form>
+
+        <p id="status-message"></p>
+
+        <!-- <script src="https://www.gstatic.com/firebasejs/12.2.1/firebase-app-compat.js"></script>
+        <script src="https://www.gstatic.com/firebasejs/12.2.1/firebase-firestore-compat.js"></script>
+        <script src="https://www.gstatic.com/firebasejs/12.2.1/firebase-auth-compat.js"></script> -->
+        <script src="config.js"></script>
+        <script type="module" src="script.js"></script>
+    </body>
+</html>
