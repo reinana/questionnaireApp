@@ -29,6 +29,12 @@ jobs:
           echo "};" >> config.js
           echo "const cloudFunctionUrl = '${{ secrets.VITE_CLOUDFUNCTION_URL }}';" >> config.js
 
+                    # ▼▼▼ このデバッグコマンドを追加 ▼▼▼
+          echo "--- Verifying file creation ---"
+          ls -l
+          # ▲▲▲ ここまで追加 ▲▲▲
+
+
       # ステップ3: frontend フォルダを gh-pages ブランチにデプロイ
       - name: Deploy 🚀
         uses: JamesIves/github-pages-deploy-action@v4
