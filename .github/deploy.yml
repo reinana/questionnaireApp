@@ -1,0 +1,30 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main # mainブランチにプッシュされたら自動実行
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 🛎️
+        uses: actions/checkout@v3
+
+      - name: Create config.js file 📝
+        run: |
+          cd frontend
+          echo "const firebaseConfig = {" > config.js
+          echo "  apiKey: '${{ secrets.VITE_FIREBASE_API_KEY }}'," >> config.js
+          echo "  authDomain: '${{ secrets.VITE_FIREBASE_AUTH_DOMAIN }}'," >> config.js
+          # ... 他のfirebaseConfigの項目も同様に追加 ...
+          echo "};" >> config.js
+          echo "const cloudFunctionUrl = '${{ secrets.VITE_CLOUDFUNCTION_URL }}';" >> config.js
+          echo "const cloudFunctionUrl = '${{ secrets.VITE_CLOUDFUNCTION_URL }}';" >> config.js
+
+      - name: Deploy 🚀
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          branch: gh-pages # 公開先のブランチ
+          folder: frontend # 公開するフォルダ

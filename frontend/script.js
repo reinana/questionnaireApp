@@ -15,10 +15,9 @@ import {
 
 // --- Firebaseの設定 ---configへ移動
 
-// Cloud FunctionのURL
-const cloudFunctionUrl =
-    "https://asia-northeast1-questionnaire-app-472614.cloudfunctions.net/questionnaire-ocr";
-    
+
+// Cloud FunctionのURL configへ移動
+
 
 // --- Firebaseの初期化 ---
 const app = initializeApp(firebaseConfig);
