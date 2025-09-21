@@ -1,28 +1,35 @@
-name: Deploy to GitHub Pages
+name: Deploy Frontend to GitHub Pages
 
+# mainブランチにpushされたときに実行
 on:
   push:
     branches:
-      - main # mainブランチにプッシュされたら自動実行
+      - main
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    
     steps:
+      # ステップ1: コードをチェックアウト
       - name: Checkout 🛎️
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
+      # ステップ2: config.js ファイルを frontend フォルダ内に作成
       - name: Create config.js file 📝
+        working-directory: ./frontend # このステップの作業場所をfrontendフォルダに指定
         run: |
-          cd frontend
           echo "const firebaseConfig = {" > config.js
           echo "  apiKey: '${{ secrets.VITE_FIREBASE_API_KEY }}'," >> config.js
           echo "  authDomain: '${{ secrets.VITE_FIREBASE_AUTH_DOMAIN }}'," >> config.js
-          # ... 他のfirebaseConfigの項目も同様に追加 ...
+          echo "  projectId: '${{ secrets.VITE_FIREBASE_PROJECT_ID }}'," >> config.js
+          echo "  storageBucket: '${{ secrets.VITE_FIREBASE_STORAGE_BUCKET }}'," >> config.js
+          echo "  messagingSenderId: '${{ secrets.VITE_FIREBASE_MESSAGING_SENDER_ID }}'," >> config.js
+          echo "  appId: '${{ secrets.VITE_FIREBASE_APP_ID }}'," >> config.js
           echo "};" >> config.js
           echo "const cloudFunctionUrl = '${{ secrets.VITE_CLOUDFUNCTION_URL }}';" >> config.js
-          echo "const cloudFunctionUrl = '${{ secrets.VITE_CLOUDFUNCTION_URL }}';" >> config.js
 
+      # ステップ3: frontend フォルダを gh-pages ブランチにデプロイ
       - name: Deploy 🚀
         uses: JamesIves/github-pages-deploy-action@v4
         with:
