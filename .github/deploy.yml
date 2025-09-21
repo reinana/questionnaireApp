@@ -28,6 +28,7 @@ jobs:
           echo "  appId: '${{ secrets.VITE_FIREBASE_APP_ID }}'," >> config.js
           echo "};" >> config.js
           echo "const cloudFunctionUrl = '${{ secrets.VITE_CLOUDFUNCTION_URL }}';" >> config.js
+          echo "ls -la config.js" # config.jsが作成されたことを確認するためにファイル一覧を表示
 
       # ステップ3: frontend フォルダを gh-pages ブランチにデプロイ
       - name: Deploy 🚀
