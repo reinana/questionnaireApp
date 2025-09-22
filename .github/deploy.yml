@@ -2,12 +2,11 @@ name: Deploy Frontend to GitHub Pages
 
 on:
   push:
-    branches:
-      - main
-  workflow_dispatch: {}            # ← 手動実行も可（任意）
+    branches: [main]
+  workflow_dispatch: {}
 
 permissions:
-  contents: write                  # ← gh-pages へ push する権限
+  contents: write
 
 jobs:
   build-and-deploy:
@@ -17,7 +16,8 @@ jobs:
       - name: Checkout 🛎️
         uses: actions/checkout@v4
 
-      - name: Create config.js file 📝
+      # 1) 機密はActions内で生成
+      - name: Create config.js 🗝️
         working-directory: ./frontend
         run: |
           echo "const firebaseConfig = {" > config.js
@@ -29,27 +29,39 @@ jobs:
           echo "  appId: '${{ secrets.VITE_FIREBASE_APP_ID }}'," >> config.js
           echo "};" >> config.js
           echo "const cloudFunctionUrl = '${{ secrets.VITE_CLOUDFUNCTION_URL }}';" >> config.js
-          echo "--- verifying ---"
-          ls -la config.js         # ← 実行（echo しない）
+          ls -la config.js
 
-      # （任意・キャッシュ対策）コミットSHAでクエリを付与
-      - name: Cache-bust script tag (optional)
+      # 2) キャッシュ無効化（index.htmlのscript参照にコミットSHAを付与）
+      - name: Cache-bust script tag
         working-directory: ./frontend
         run: |
           SHORT=${GITHUB_SHA::7}
+          # script.js の参照に ?v=xxxx を付ける（存在すれば置換、無ければ無視）
           sed -i "s|script\.js|script.js?v=$SHORT|g" index.html || true
 
+      # 3) デプロイ直前に中身を**実体**で確認（ここが最新かどうかが真因）
       - name: Show files to deploy 🔍
         run: |
           echo "Commit: $GITHUB_SHA"
           ls -la frontend
-          echo "---- script.js head ----"
+          echo "---- script.js (HEAD 20 lines) ----"
           sed -n '1,20p' frontend/script.js || true
 
+      # 4) デプロイ（古いファイルは掃除）
       - name: Deploy 🚀
         uses: JamesIves/github-pages-deploy-action@v4
         with:
-          branch: gh-pages          # 公開先
-          folder: frontend          # 公開フォルダ（ビルドなし前提）
-          clean: true               # 既存ファイルを掃除（重要）
-          single-
+          branch: gh-pages
+          folder: frontend
+          clean: true
+          single-commit: true
+
+      # 5) 本当に gh-pages に反映されたかを**ブランチから**確認
+      - name: Verify on gh-pages branch ✅
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+      - name: Show deployed script.js 🔎
+        run: |
+          echo "---- gh-pages/script.js (HEAD 20 lines) ----"
+          sed -n '1,20p' script.js || true
