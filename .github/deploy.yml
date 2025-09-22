@@ -3,20 +3,18 @@ name: Deploy Frontend to GitHub Pages
 on:
   push:
     branches: [main]
-  workflow_dispatch: {}
+  workflow_dispatch: {}          # 失敗時に手動実行できる
 
 permissions:
-  contents: write
+  contents: write                # gh-pages に push する権限
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout 🛎️
         uses: actions/checkout@v4
 
-      # 1) 機密はActions内で生成
       - name: Create config.js 🗝️
         working-directory: ./frontend
         run: |
@@ -31,37 +29,16 @@ jobs:
           echo "const cloudFunctionUrl = '${{ secrets.VITE_CLOUDFUNCTION_URL }}';" >> config.js
           ls -la config.js
 
-      # 2) キャッシュ無効化（index.htmlのscript参照にコミットSHAを付与）
-      - name: Cache-bust script tag
-        working-directory: ./frontend
-        run: |
-          SHORT=${GITHUB_SHA::7}
-          # script.js の参照に ?v=xxxx を付ける（存在すれば置換、無ければ無視）
-          sed -i "s|script\.js|script.js?v=$SHORT|g" index.html || true
-
-      # 3) デプロイ直前に中身を**実体**で確認（ここが最新かどうかが真因）
-      - name: Show files to deploy 🔍
+      - name: Show files to deploy 🔍   # ← 本当に最新のscript.jsを配るか確認
         run: |
           echo "Commit: $GITHUB_SHA"
           ls -la frontend
-          echo "---- script.js (HEAD 20 lines) ----"
           sed -n '1,20p' frontend/script.js || true
 
-      # 4) デプロイ（古いファイルは掃除）
       - name: Deploy 🚀
         uses: JamesIves/github-pages-deploy-action@v4
         with:
           branch: gh-pages
-          folder: frontend
-          clean: true
-          single-commit: true
-
-      # 5) 本当に gh-pages に反映されたかを**ブランチから**確認
-      - name: Verify on gh-pages branch ✅
-        uses: actions/checkout@v4
-        with:
-          ref: gh-pages
-      - name: Show deployed script.js 🔎
-        run: |
-          echo "---- gh-pages/script.js (HEAD 20 lines) ----"
-          sed -n '1,20p' script.js || true
+          folder: frontend          # ビルドなしなら frontend / ビルドありは frontend/dist
+          clean: true               # 既存ファイルを掃除してから上書き
+          single-commit: true       # （任意）履歴をスリムに
