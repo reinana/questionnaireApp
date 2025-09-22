@@ -1,23 +1,24 @@
 name: Deploy Frontend to GitHub Pages
 
-# mainブランチにpushされたときに実行
 on:
   push:
     branches:
       - main
+  workflow_dispatch: {}            # ← 手動実行も可（任意）
+
+permissions:
+  contents: write                  # ← gh-pages へ push する権限
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    
+
     steps:
-      # ステップ1: コードをチェックアウト
       - name: Checkout 🛎️
         uses: actions/checkout@v4
 
-      # ステップ2: config.js ファイルを frontend フォルダ内に作成
       - name: Create config.js file 📝
-        working-directory: ./frontend # このステップの作業場所をfrontendフォルダに指定
+        working-directory: ./frontend
         run: |
           echo "const firebaseConfig = {" > config.js
           echo "  apiKey: '${{ secrets.VITE_FIREBASE_API_KEY }}'," >> config.js
@@ -28,11 +29,27 @@ jobs:
           echo "  appId: '${{ secrets.VITE_FIREBASE_APP_ID }}'," >> config.js
           echo "};" >> config.js
           echo "const cloudFunctionUrl = '${{ secrets.VITE_CLOUDFUNCTION_URL }}';" >> config.js
-          echo "ls -la config.js" # config.jsが作成されたことを確認するためにファイル一覧を表示
+          echo "--- verifying ---"
+          ls -la config.js         # ← 実行（echo しない）
 
-      # ステップ3: frontend フォルダを gh-pages ブランチにデプロイ
+      # （任意・キャッシュ対策）コミットSHAでクエリを付与
+      - name: Cache-bust script tag (optional)
+        working-directory: ./frontend
+        run: |
+          SHORT=${GITHUB_SHA::7}
+          sed -i "s|script\.js|script.js?v=$SHORT|g" index.html || true
+
+      - name: Show files to deploy 🔍
+        run: |
+          echo "Commit: $GITHUB_SHA"
+          ls -la frontend
+          echo "---- script.js head ----"
+          sed -n '1,20p' frontend/script.js || true
+
       - name: Deploy 🚀
         uses: JamesIves/github-pages-deploy-action@v4
         with:
-          branch: gh-pages # 公開先のブランチ
-          folder: frontend # 公開するフォルダ
+          branch: gh-pages          # 公開先
+          folder: frontend          # 公開フォルダ（ビルドなし前提）
+          clean: true               # 既存ファイルを掃除（重要）
+          single-
