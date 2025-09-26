@@ -33,6 +33,7 @@ const statusMessage = document.getElementById("status-message");
 const settingsContainer = document.getElementById("settings-container");
 const settingsForm = document.getElementById("settings-form");
 const sheetIdInput = document.getElementById("sheet-id-input");
+const currentSheetIdElement = document.getElementById("current-sheet-id"); // 新しい要素を取得
 
 // --- グローバル変数 ---
 let currentUserIdToken = null;
@@ -53,9 +54,9 @@ onAuthStateChanged(auth, async (user) => {
         const userDocRef = doc(db, "users", user.uid);
         const docSnap = await getDoc(userDocRef);
         if (docSnap.exists() && docSnap.data().spreadsheetId) {
-            sheetIdInput.value = docSnap.data().spreadsheetId;
+            currentSheetIdElement.textContent = docSnap.data().spreadsheetId;
         } else {
-            sheetIdInput.value = ""; // 設定がなければ空にする
+            currentSheetIdElement.textContent = "未設定"; // 未設定の場合
         }
     } else {
         // ログアウトしている場合
@@ -89,12 +90,16 @@ settingsForm.addEventListener("submit", async (event) => {
         let spreadsheetId = sheetIdInput.value.trim(); // .trim()で前後の空白を削除
 
         // 入力された値がURL形式かチェック
-        if (spreadsheetId.startsWith("https://docs.google.com/spreadsheets/d/")){
+        if (
+            spreadsheetId.startsWith("https://docs.google.com/spreadsheets/d/")
+        ) {
             // URLからID部分だけを抜き出す正規表現
             const match = spreadsheetId.match(/\/d\/(.*?)\//);
             if (match && match[1]) {
                 spreadsheetId = match[1]; // 抜き出したIDを代入
                 sheetIdInput.value = spreadsheetId; // 入力欄もIDだけの表示に更新
+                console.log("抽出されたスプレッドシートID:", spreadsheetId);
+            
             }
         }
 
@@ -107,6 +112,10 @@ settingsForm.addEventListener("submit", async (event) => {
         try {
             await setDoc(userDocRef, { spreadsheetId: spreadsheetId });
             statusMessage.textContent = "設定を保存しました。";
+
+            // 保存に成功したら、表示エリアも更新
+            currentSheetIdElement.textContent = spreadsheetId;
+            sheetIdInput.value = ""; // 入力欄はクリアする
         } catch (error) {
             console.error("設定の保存エラー:", error);
             statusMessage.textContent = "設定の保存に失敗しました。";
