@@ -17,23 +17,13 @@
 
         <div id="main-content" style="display: none">
             <h3>フェーズ1：アンケートテンプレート作成</h3>
-            <p>
-                まず、新しい種類のアンケートを処理するために、見本となるファイルを1枚アップロードしてテンプレートを作成します。
-            </p>
             <form id="template-form">
                 <div>
                     <label for="template-name-input">テンプレート名:</label>
-                    <input
-                        type="text"
-                        id="template-name-input"
-                        required
-                        placeholder="例: 2025年度健康調査"
-                    />
+                    <input type="text" id="template-name-input" required />
                 </div>
                 <div>
-                    <label for="template-file-input"
-                        >見本ファイル (画像 or PDF 1枚):</label
-                    >
+                    <label for="template-file-input">見本ファイル (1枚):</label>
                     <input
                         type="file"
                         id="template-file-input"
@@ -47,27 +37,16 @@
             <hr />
 
             <h3>フェーズ2：データ抽出</h3>
-            <p>
-                作成済みのテンプレートを選択し、回答済みのアンケートファイル（複数選択可）をアップロードしてください。
-            </p>
             <form id="upload-form">
                 <div>
                     <label for="template-select">使用するテンプレート:</label>
-                    <select id="template-select" required>
-                        <option value="">テンプレートを選択してください</option>
-                    </select>
+                    <select id="template-select" required></select>
                 </div>
                 <div>
                     <label for="sheet-id-input"
                         >書き込み先のGoogleスプレッドシートID:</label
                     >
-                    <input
-                        type="text"
-                        id="sheet-id-input"
-                        size="50"
-                        required
-                        placeholder="URLまたはIDを貼り付け"
-                    />
+                    <input type="text" id="sheet-id-input" size="50" required />
                 </div>
                 <div>
                     <label for="file-input"

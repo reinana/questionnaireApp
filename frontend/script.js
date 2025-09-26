@@ -79,7 +79,7 @@ onAuthStateChanged(auth, async (user) => {
         );
         const snapshot = await getDocs(templatesCollectionRef);
         templateSelect.innerHTML =
-            '<option value="">テンプレートを選択してください</option>';
+            '<option value="">テンプレートを選択してください</option>'; // 初期化
         snapshot.forEach((doc) => {
             const option = document.createElement("option");
             option.value = doc.id;
