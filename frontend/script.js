@@ -116,20 +116,23 @@ logoutButton.addEventListener("click", () => {
 // --- テンプレート一覧を読み込む関数 ---
 async function loadTemplates() {
     const user = auth.currentUser;
-    if (user) {
-        const templatesCollection = db
-            .collection("users")
-            .doc(user.uid)
-            .collection("templates");
-        const snapshot = await templatesCollection.get();
+    if (!user) return;
+
+    try {
+        const colRef = collection(db, "users", user.uid, "templates");
+        const snap = await getDocs(colRef);
+
         templateSelect.innerHTML =
             '<option value="">テンプレートを選択してください</option>';
-        snapshot.forEach((doc) => {
+
+        snap.forEach((docSnap) => {
             const option = document.createElement("option");
-            option.value = doc.id;
-            option.textContent = doc.id;
+            option.value = docSnap.id; // ← ドキュメントID
+            option.textContent = docSnap.id; // 表示名をフィールドにしたいなら docSnap.data().name など
             templateSelect.appendChild(option);
         });
+    } catch (e) {
+        console.error("テンプレート読み込みエラー:", e);
     }
 }
 // --- テンプレート作成フォームの処理 ---
