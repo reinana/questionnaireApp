@@ -86,7 +86,18 @@ settingsForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     const user = auth.currentUser;
     if (user) {
-        const spreadsheetId = sheetIdInput.value;
+        let spreadsheetId = sheetIdInput.value.trim(); // .trim()で前後の空白を削除
+
+        // 入力された値がURL形式かチェック
+        if (spreadsheetId.startsWith("https://docs.google.com/spreadsheets/d/")){
+            // URLからID部分だけを抜き出す正規表現
+            const match = spreadsheetId.match(/\/d\/(.*?)\//);
+            if (match && match[1]) {
+                spreadsheetId = match[1]; // 抜き出したIDを代入
+                sheetIdInput.value = spreadsheetId; // 入力欄もIDだけの表示に更新
+            }
+        }
+
         if (!spreadsheetId) {
             statusMessage.textContent =
                 "スプレッドシートIDを入力してください。";
