@@ -66,7 +66,7 @@ def analyze_survey_template(request):
             raise ValueError("ファイルが含まれていません。")
 
         # --- Geminiによる質問項目の抽出 ---
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         image_part = {"mime_type": uploaded_file.mimetype, "data": uploaded_file.read()}
         
         prompt_for_questions = """
