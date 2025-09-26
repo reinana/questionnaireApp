@@ -62,6 +62,7 @@ onAuthStateChanged(auth, async (user) => {
         // settingsContainer.style.display = "block";
         mainContent.style.display = "block";
         currentUserIdToken = await user.getIdToken();
+        loadTemplates();
 
         // // Firestoreから設定を読み込んで表示
         // const userDocRef = doc(db, "users", user.uid);
@@ -112,7 +113,25 @@ loginButton.addEventListener("click", () => {
 logoutButton.addEventListener("click", () => {
     signOut(auth);
 });
-
+// --- テンプレート一覧を読み込む関数 ---
+async function loadTemplates() {
+    const user = auth.currentUser;
+    if (user) {
+        const templatesCollection = db
+            .collection("users")
+            .doc(user.uid)
+            .collection("templates");
+        const snapshot = await templatesCollection.get();
+        templateSelect.innerHTML =
+            '<option value="">テンプレートを選択してください</option>';
+        snapshot.forEach((doc) => {
+            const option = document.createElement("option");
+            option.value = doc.id;
+            option.textContent = doc.id;
+            templateSelect.appendChild(option);
+        });
+    }
+}
 // --- テンプレート作成フォームの処理 ---
 templateForm.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -143,7 +162,7 @@ templateForm.addEventListener("submit", async (event) => {
         templateStatusMessage.textContent = result;
         if (response.ok) {
             // 成功したらテンプレート一覧を再読み込み
-            onAuthStateChanged(auth, auth.currentUser);
+            loadTemplates();
         }
     } catch (error) {
         console.error("テンプレート作成エラー:", error);
