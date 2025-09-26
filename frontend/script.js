@@ -99,7 +99,6 @@ settingsForm.addEventListener("submit", async (event) => {
                 spreadsheetId = match[1]; // 抜き出したIDを代入
                 sheetIdInput.value = spreadsheetId; // 入力欄もIDだけの表示に更新
                 console.log("抽出されたスプレッドシートID:", spreadsheetId);
-            
             }
         }
 
@@ -145,6 +144,9 @@ uploadForm.addEventListener("submit", async (event) => {
     for (let i = 0; i < files.length; i++) {
         formData.append("files", files[i]);
     }
+
+    const promptItems = document.getElementById("prompt-items").value;
+    formData.append("prompt_items", promptItems);
 
     try {
         const response = await fetch(cloudFunctionUrl, {

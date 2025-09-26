@@ -23,13 +23,24 @@
                     type="text"
                     id="sheet-id-input"
                     size="50"
-                    placeholder="スプレッドシートのURLからIDをコピーしてください"
+                    placeholder="スプレッドシートのURLをコピーしてください"
                 />
                 <button type="submit">保存</button>
             </form>
         </div>
 
         <form id="upload-form" style="display: none">
+            <h3>抽出したい項目</h3>
+            <p>
+                アンケートから抜き出したい項目を、1行に1つずつ入力してください。
+            </p>
+            <textarea
+                id="prompt-items"
+                rows="10"
+                cols="50"
+                placeholder="例：&#10;氏名&#10;年齢&#10;満足度"
+            ></textarea>
+            <hr />
             <input type="file" id="file-input" accept="image/*" multiple />
             <button type="submit">アップロード</button>
         </form>

@@ -3,3 +3,4 @@ google-cloud-vision
 google-api-python-client
 google-auth
 firebase-admin
+google-generativeai
