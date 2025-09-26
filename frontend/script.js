@@ -27,14 +27,14 @@ const provider = new GoogleAuthProvider();
 const loginButton = document.getElementById("login-button");
 const logoutButton = document.getElementById("logout-button");
 const userInfo = document.getElementById("user-info");
+const mainContent = document.getElementById("main-content");
+const statusMessage = document.getElementById("status-message");
 // データ抽出フォーム
 const uploadForm = document.getElementById("upload-form");
 const fileInput = document.getElementById("file-input");
 const templateSelect = document.getElementById("template-select");
 const sheetIdInput = document.getElementById("sheet-id-input");
 
-const mainContent = document.getElementById("main-content");
-const statusMessage = document.getElementById("status-message");
 // const settingsContainer = document.getElementById("settings-container");
 // const settingsForm = document.getElementById("settings-form");
 // const currentSheetIdElement = document.getElementById("current-sheet-id");
@@ -190,91 +190,91 @@ uploadForm.addEventListener("submit", async (event) => {
     }
 });
 
-// --- 設定フォームの保存処理 ---
-settingsForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const user = auth.currentUser;
-    if (user) {
-        let spreadsheetId = sheetIdInput.value.trim(); // .trim()で前後の空白を削除
+// // --- 設定フォームの保存処理 ---
+// settingsForm.addEventListener("submit", async (event) => {
+//     event.preventDefault();
+//     const user = auth.currentUser;
+//     if (user) {
+//         let spreadsheetId = sheetIdInput.value.trim(); // .trim()で前後の空白を削除
 
-        // 入力された値がURL形式かチェック
-        if (
-            spreadsheetId.startsWith("https://docs.google.com/spreadsheets/d/")
-        ) {
-            // URLからID部分だけを抜き出す正規表現
-            const match = spreadsheetId.match(/\/d\/(.*?)\//);
-            if (match && match[1]) {
-                spreadsheetId = match[1]; // 抜き出したIDを代入
-                sheetIdInput.value = spreadsheetId; // 入力欄もIDだけの表示に更新
-                console.log("抽出されたスプレッドシートID:", spreadsheetId);
-            }
-        }
+//         // 入力された値がURL形式かチェック
+//         if (
+//             spreadsheetId.startsWith("https://docs.google.com/spreadsheets/d/")
+//         ) {
+//             // URLからID部分だけを抜き出す正規表現
+//             const match = spreadsheetId.match(/\/d\/(.*?)\//);
+//             if (match && match[1]) {
+//                 spreadsheetId = match[1]; // 抜き出したIDを代入
+//                 sheetIdInput.value = spreadsheetId; // 入力欄もIDだけの表示に更新
+//                 console.log("抽出されたスプレッドシートID:", spreadsheetId);
+//             }
+//         }
 
-        if (!spreadsheetId) {
-            statusMessage.textContent =
-                "スプレッドシートIDを入力してください。";
-            return;
-        }
-        const userDocRef = doc(db, "users", user.uid);
-        try {
-            await setDoc(userDocRef, { spreadsheetId: spreadsheetId });
-            statusMessage.textContent = "設定を保存しました。";
+//         if (!spreadsheetId) {
+//             statusMessage.textContent =
+//                 "スプレッドシートIDを入力してください。";
+//             return;
+//         }
+//         const userDocRef = doc(db, "users", user.uid);
+//         try {
+//             await setDoc(userDocRef, { spreadsheetId: spreadsheetId });
+//             statusMessage.textContent = "設定を保存しました。";
 
-            // 保存に成功したら、表示エリアも更新
-            currentSheetIdElement.textContent = spreadsheetId;
-            sheetIdInput.value = ""; // 入力欄はクリアする
-        } catch (error) {
-            console.error("設定の保存エラー:", error);
-            statusMessage.textContent = "設定の保存に失敗しました。";
-        }
-    }
-});
+//             // 保存に成功したら、表示エリアも更新
+//             currentSheetIdElement.textContent = spreadsheetId;
+//             sheetIdInput.value = ""; // 入力欄はクリアする
+//         } catch (error) {
+//             console.error("設定の保存エラー:", error);
+//             statusMessage.textContent = "設定の保存に失敗しました。";
+//         }
+//     }
+// });
 
-// --- アップロードフォームの処理 ---
-uploadForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
+// // --- アップロードフォームの処理 ---
+// uploadForm.addEventListener("submit", async (event) => {
+//     event.preventDefault();
 
-    if (!currentUserIdToken) {
-        statusMessage.textContent =
-            "ログイン情報が取得できませんでした。ページを再読み込みしてください。";
-        return;
-    }
+//     if (!currentUserIdToken) {
+//         statusMessage.textContent =
+//             "ログイン情報が取得できませんでした。ページを再読み込みしてください。";
+//         return;
+//     }
 
-    const files = fileInput.files;
-    if (files.length === 0) {
-        statusMessage.textContent = "ファイルを選択してください。";
-        return;
-    }
+//     const files = fileInput.files;
+//     if (files.length === 0) {
+//         statusMessage.textContent = "ファイルを選択してください。";
+//         return;
+//     }
 
-    statusMessage.textContent = `アップロード中... (${files.length}件)`;
+//     statusMessage.textContent = `アップロード中... (${files.length}件)`;
 
-    const formData = new FormData();
-    for (let i = 0; i < files.length; i++) {
-        formData.append("files", files[i]);
-    }
+//     const formData = new FormData();
+//     for (let i = 0; i < files.length; i++) {
+//         formData.append("files", files[i]);
+//     }
 
-    const promptItems = document.getElementById("prompt-items").value;
-    formData.append("prompt_items", promptItems);
+//     const promptItems = document.getElementById("prompt-items").value;
+//     formData.append("prompt_items", promptItems);
 
-    try {
-        const response = await fetch(cloudFunctionUrl, {
-            method: "POST",
-            headers: {
-                Authorization: `Bearer ${currentUserIdToken}`,
-            },
-            body: formData,
-        });
+//     try {
+//         const response = await fetch(cloudFunctionUrl, {
+//             method: "POST",
+//             headers: {
+//                 Authorization: `Bearer ${currentUserIdToken}`,
+//             },
+//             body: formData,
+//         });
 
-        const result = await response.text();
+//         const result = await response.text();
 
-        if (response.ok) {
-            statusMessage.textContent = `成功！サーバーからの返事: ${result}`;
-        } else {
-            statusMessage.textContent = `エラー: ${result}`;
-        }
-    } catch (error) {
-        console.error("通信エラー:", error);
-        statusMessage.textContent =
-            "通信エラーが発生しました。コンソールを確認してください。";
-    }
-});
+//         if (response.ok) {
+//             statusMessage.textContent = `成功！サーバーからの返事: ${result}`;
+//         } else {
+//             statusMessage.textContent = `エラー: ${result}`;
+//         }
+//     } catch (error) {
+//         console.error("通信エラー:", error);
+//         statusMessage.textContent =
+//             "通信エラーが発生しました。コンソールを確認してください。";
+//     }
+// });
