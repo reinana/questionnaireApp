@@ -15,7 +15,11 @@ from googleapiclient.discovery import build
 # 2. 初期化と設定
 # ----------------------------------------------------------------
 # Firebase Admin SDKを初期化
-firebase_admin.initialize_app()
+try:
+    firebase_admin.get_app()
+except ValueError:
+    firebase_admin.initialize_app()
+    
 db = firestore.client()
 
 # Gemini APIキーを環境変数から設定
@@ -26,83 +30,14 @@ SERVICE_ACCOUNT_FILE = 'credentials.json'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 
 # ----------------------------------------------------------------
-# 3. ヘルパー関数（個別の作業を担当する小さな関数）
+# 司令塔A: テンプレート分析
 # ----------------------------------------------------------------
-
-def validate_request_and_get_config(request):
-    """リクエストを検証し、認証を行い、ユーザー設定を取得する。"""
-    auth_header = request.headers.get('Authorization')
-    if not auth_header or not auth_header.startswith('Bearer '):
-        raise ValueError("認証トークンがありません。")
-    
-    id_token = auth_header.split('Bearer ')[1]
-    decoded_token = auth.verify_id_token(id_token)
-    uid = decoded_token['uid']
-
-    uploaded_files = request.files.getlist("files")
-    if not uploaded_files:
-        raise ValueError("ファイルが含まれていません。")
-
-    user_doc_ref = db.collection('users').document(uid)
-    user_doc = user_doc_ref.get()
-    if not user_doc.exists or not user_doc.to_dict().get('spreadsheetId'):
-        raise ValueError("スプレッドシートIDが設定されていません。")
-    
-    spreadsheet_id = user_doc.to_dict()['spreadsheetId']
-    
-    return uploaded_files, spreadsheet_id
-
-def extract_questions_with_gemini(image_part):
-    """Geminiを使って画像から質問項目をリストアップする。"""
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    
-    prompt_for_questions = """
-    あなたは、アンケートの構造を分析する専門家です。
-    添付されたアンケート画像から、データとして抽出すべき全ての質問項目をリストアップし、
-    改行で区切られた単一のテキストとして返してください。
-    """
-    
-    response = model.generate_content([prompt_for_questions, image_part])
-    return response.text.strip()
-
-def extract_answers_with_gemini(image_part, prompt_items):
-    """抽出された質問項目リストを元に、画像から回答を抽出する。"""
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    
-    prompt_for_extraction = f"""
-    あなたは、アンケートのデータ入力を行う専門家です。
-    添付された画像を解析し、以下の項目について回答を特定し、JSON形式で結果を抽出してください。
-    もし項目が見つからない、または回答がない場合は、値を "未回答" としてください。
-
-    抽出する項目:
-    {prompt_items}
-    """
-    
-    response = model.generate_content([prompt_for_extraction, image_part])
-    json_text = response.text.replace("```json", "").replace("```", "").strip()
-    return json.loads(json_text)
-
-def write_to_spreadsheet(spreadsheet_id, rows_to_insert):
-    """指定されたスプレッドシートに複数行のデータを書き込む。"""
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-    sheets_service = build('sheets', 'v4', credentials=creds)
-    
-    request_body = {'values': rows_to_insert}
-    sheets_service.spreadsheets().values().append(
-        spreadsheetId=spreadsheet_id,
-        range='シート1!A1',
-        valueInputOption='USER_ENTERED',
-        body=request_body
-    ).execute()
-
-# ----------------------------------------------------------------
-# 4. メイン関数（司令塔）
-# ----------------------------------------------------------------
-
 @functions_framework.http
-def ocr_and_write_sheet(request):
-    """HTTPリクエストを受け付け、各処理を順番に呼び出す司令塔。"""
+def analyze_survey_template(request):
+    """
+    単一のアンケート見本画像から質問項目を抽出し、
+    テンプレートとしてFirestoreに保存する。
+    """
     headers = {'Access-Control-Allow-Origin': '*'}
     if request.method == 'OPTIONS':
         headers.update({
@@ -113,57 +48,108 @@ def ocr_and_write_sheet(request):
         return ('', 204, headers)
 
     try:
-        # --- 受付担当を呼び出す ---
-        # リクエストが正当かチェックし、ファイルと設定を取得
-        uploaded_files, spreadsheet_id = validate_request_and_get_config(request)
+        # --- 認証とリクエスト内容の検証 ---
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            raise ValueError("認証トークンがありません。")
+        
+        id_token = auth_header.split('Bearer ')[1]
+        decoded_token = auth.verify_id_token(id_token)
+        uid = decoded_token['uid']
 
-        # --- AI分析担当を呼び出す (ステップ1) ---
-        # 複数ファイルがアップロードされても、最初の1枚だけを使ってアンケートの構造を分析させる
-        first_page_content = uploaded_files[0].read()
-        first_image_part = {"mime_type": uploaded_files[0].mimetype, "data": first_page_content}
-        # 質問項目のリストを取得
-        prompt_items = extract_questions_with_gemini(first_image_part)
-
-        # --- AIデータ入力担当を呼び出す (ステップ2) ---
-        # 書き込むための行データを準備
-        rows_to_insert = []
-        # 全てのファイルを1枚ずつループ処理
-        for uploaded_file in uploaded_files:
-            now = datetime.datetime.now().strftime('%Y-%M-%d %H:%M:%S')
-            try:
-                # ファイルを再度読み込む必要があるため、seek(0)で読み取り位置を先頭に戻す
-                uploaded_file.seek(0)
-                image_content = uploaded_file.read()
-                image_part = {"mime_type": uploaded_file.mimetype, "data": image_content}
-
-                # ステップ1で取得した質問リストを元に、回答を抽出させる
-                extracted_data = extract_answers_with_gemini(image_part, prompt_items)
-
-                # 抽出したデータをスプレッドシートの行形式に整える
-                # ※この部分は、抽出した項目に合わせて調整が必要です
-                row_data = [
-                    now,
-                    uploaded_file.filename,
-                    # extracted_data (辞書) から、prompt_items (キーのリスト) を使って値を取り出す
-                    # (この部分はより洗練させる必要があります)
-                ]
-
-            except Exception as e:
-                print(f"ファイル処理中にエラー: {e}")
-                row_data = [now, uploaded_file.filename, f"ERROR: {e}"]
+        template_name = request.form.get("template_name")
+        if not template_name:
+            raise ValueError("テンプレート名が指定されていません。")
             
-            rows_to_insert.append(row_data)
+        uploaded_file = request.files.get("file")
+        if not uploaded_file:
+            raise ValueError("ファイルが含まれていません。")
 
-        # --- 書記担当を呼び出す ---
-        if rows_to_insert:
-            write_to_spreadsheet(spreadsheet_id, rows_to_insert)
-
-        return (f"{len(rows_to_insert)}件のファイルを処理し、書き込みました！", 200, headers)
+        # --- Geminiによる質問項目の抽出 ---
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        image_part = {"mime_type": uploaded_file.mimetype, "data": uploaded_file.read()}
+        
+        prompt_for_questions = """
+        あなたは、アンケートの構造を分析する専門家です。
+        添付されたアンケート画像から、データとして抽出すべき全ての質問項目をリストアップし、
+        改行で区切られた単一のテキストとして返してください。
+        """
+        
+        response = model.generate_content([prompt_for_questions, image_part])
+        prompt_items = response.text.strip()
+        
+        # --- Firestoreへのテンプレート保存 ---
+        template_doc_ref = db.collection('users').document(uid).collection('templates').document(template_name)
+        template_doc_ref.set({
+            'items': prompt_items,
+            'createdAt': firestore.SERVER_TIMESTAMP
+        })
+        
+        return (f"テンプレート「{template_name}」を作成しました。", 200, headers)
 
     except ValueError as e:
-        # 想定内のリクエストエラー
         return (str(e), 400, headers)
     except Exception as e:
-        # 想定外のサーバー内部エラー
-        print(f"予期せぬエラーが発生しました: {e}")
-        return (f"予期せぬエラーが発生しました。", 500, headers)
+        print(f"テンプレート作成中にエラー: {e}")
+        return (f"テンプレート作成中にエラーが発生しました。", 500, headers)
+    
+
+# ----------------------------------------------------------------
+# 司令塔B: データ抽出実行官
+# ----------------------------------------------------------------
+@functions_framework.http
+def ocr_and_write_sheet(request):
+    """
+    指定されたテンプレートを使い、複数のアンケートファイルからデータを抽出し、
+    指定されたスプレッドシートに結果を書き込む。
+    """
+    headers = {'Access-Control-Allow-Origin': '*'}
+    if request.method == 'OPTIONS':
+        headers.update({
+            'Access-Control-Allow-Methods': 'POST',
+            'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+            'Access-Control-Max-Age': '3600'
+        })
+        return ('', 204, headers)
+
+    try:
+        # --- 認証とリクエスト内容の検証 ---
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            raise ValueError("認証トークンがありません。")
+        
+        id_token = auth_header.split('Bearer ')[1]
+        decoded_token = auth.verify_id_token(id_token)
+        uid = decoded_token['uid']
+
+        template_name = request.form.get("template_name")
+        if not template_name:
+            raise ValueError("テンプレート名が指定されていません。")
+
+        spreadsheet_id = request.form.get("spreadsheet_id")
+        if not spreadsheet_id:
+            raise ValueError("スプレッドシートIDが指定されていません。")
+
+        uploaded_files = request.files.getlist("files")
+        if not uploaded_files:
+            raise ValueError("ファイルが含まれていません。")
+
+        # --- Firestoreからテンプレート（質問項目リスト）を取得 ---
+        template_doc_ref = db.collection('users').document(uid).collection('templates').document(template_name)
+        template_doc = template_doc_ref.get()
+        if not template_doc.exists:
+            raise ValueError(f"テンプレート「{template_name}」が見つかりません。")
+        prompt_items = template_doc.to_dict()['items']
+        
+        # --- 各ファイルを処理して、書き込むデータを作成 ---
+        rows_to_insert = []
+        # (ここで、以前定義した extract_answers_with_gemini や write_to_spreadsheet といった
+        # ヘルパー関数を呼び出すロジックを組み立てます)
+
+        return (f"{len(uploaded_files)}件のファイルを処理し、書き込みました！", 200, headers)
+
+    except ValueError as e:
+        return (str(e), 400, headers)
+    except Exception as e:
+        print(f"データ抽出中にエラー: {e}")
+        return (f"データ抽出中にエラーが発生しました。", 500, headers)

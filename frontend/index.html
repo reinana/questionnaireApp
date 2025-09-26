@@ -1,8 +1,12 @@
 <!DOCTYPE html>
 <html lang="ja">
-    <head> </head>
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>アンケートOCRアプリ</title>
+    </head>
     <body>
-        <h1>アンケート画像アップローダー</h1>
+        <h1>アンケートOCRアプリ</h1>
 
         <div id="auth-container">
             <p id="user-info">ログインしていません</p>
@@ -11,39 +15,75 @@
         </div>
         <hr />
 
-        <div id="settings-container" style="display: none">
-            <h3>設定</h3>
-            <p>現在保存中のID: <strong id="current-sheet-id">未設定</strong></p>
+        <div id="main-content" style="display: none">
+            <h3>フェーズ1：アンケートテンプレート作成</h3>
+            <p>
+                まず、新しい種類のアンケートを処理するために、見本となるファイルを1枚アップロードしてテンプレートを作成します。
+            </p>
+            <form id="template-form">
+                <div>
+                    <label for="template-name-input">テンプレート名:</label>
+                    <input
+                        type="text"
+                        id="template-name-input"
+                        required
+                        placeholder="例: 2025年度健康調査"
+                    />
+                </div>
+                <div>
+                    <label for="template-file-input"
+                        >見本ファイル (画像 or PDF 1枚):</label
+                    >
+                    <input
+                        type="file"
+                        id="template-file-input"
+                        accept="image/*,application/pdf"
+                        required
+                    />
+                </div>
+                <button type="submit">テンプレート作成</button>
+            </form>
+            <p id="template-status-message"></p>
+            <hr />
 
-            <form id="settings-form">
-                <label for="sheet-id-input"
-                    >書き込み先のGoogleスプレッドシートID:</label
-                >
-                <input
-                    type="text"
-                    id="sheet-id-input"
-                    size="50"
-                    placeholder="スプレッドシートのURLをコピーしてください"
-                />
-                <button type="submit">保存</button>
+            <h3>フェーズ2：データ抽出</h3>
+            <p>
+                作成済みのテンプレートを選択し、回答済みのアンケートファイル（複数選択可）をアップロードしてください。
+            </p>
+            <form id="upload-form">
+                <div>
+                    <label for="template-select">使用するテンプレート:</label>
+                    <select id="template-select" required>
+                        <option value="">テンプレートを選択してください</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="sheet-id-input"
+                        >書き込み先のGoogleスプレッドシートID:</label
+                    >
+                    <input
+                        type="text"
+                        id="sheet-id-input"
+                        size="50"
+                        required
+                        placeholder="URLまたはIDを貼り付け"
+                    />
+                </div>
+                <div>
+                    <label for="file-input"
+                        >アンケートファイル (複数選択可):</label
+                    >
+                    <input
+                        type="file"
+                        id="file-input"
+                        accept="image/*,application/pdf"
+                        multiple
+                        required
+                    />
+                </div>
+                <button type="submit">抽出開始</button>
             </form>
         </div>
-
-        <form id="upload-form" style="display: none">
-            <h3>抽出したい項目</h3>
-            <p>
-                アンケートから抜き出したい項目を、1行に1つずつ入力してください。
-            </p>
-            <textarea
-                id="prompt-items"
-                rows="10"
-                cols="50"
-                placeholder="例：&#10;氏名&#10;年齢&#10;満足度"
-            ></textarea>
-            <hr />
-            <input type="file" id="file-input" accept="image/*" multiple />
-            <button type="submit">アップロード</button>
-        </form>
 
         <p id="status-message"></p>
 

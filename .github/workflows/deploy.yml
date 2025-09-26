@@ -27,6 +27,8 @@ jobs:
           echo "  appId: '${{ secrets.VITE_FIREBASE_APP_ID }}'," >> config.js
           echo "};" >> config.js
           echo "const cloudFunctionUrl = '${{ secrets.VITE_CLOUDFUNCTION_URL }}';" >> config.js
+          echo "const analyzeFunctionUrl = '${{ secrets.VITE_ANALYZE_FUNCTION_URL }}';" >> config.js
+          echo "const processFunctionUrl = '${{ secrets.VITE_PROCESS_FUNCTION_URL }}';" >> config.js
           ls -la config.js
 
       - name: Show files to deploy 🔍   # ← 本当に最新のscript.jsを配るか確認
