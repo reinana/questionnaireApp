@@ -121,49 +121,104 @@ def _clamp(s: str, max_chars: int = 20_000) -> str:
 
 def call_gemini_for_row(full_text: str, items: list[str]) -> list[str]:
     """
-    OCR全文から、設問リスト順の回答配列を返す。
-    設問を小分けにしてGeminiへ投げ、JSON配列で受け取る。
+    OCR全文から、設問リスト(items)の順に回答を抽出して返す。
+    - 設問を小分け(既定8問)で投げる
+    - モデルは pro-latest → flash-latest の順にフォールバック
+    - 出力は必ず items と同じ長さの文字列配列（不足は N/A で埋める）
     """
-    base_prompt = (
-        "以下のOCR全文から、与えた設問の回答だけを抽出してください。"
-        "回答が見当たらない場合は \"N/A\" を返してください。"
-        "必ず JSON の文字列配列のみを返してください。"
-    )
-    CHUNK = 15
+    if not items:
+        return []
+
+    MODELS = [
+        "gemini-1.5-pro-latest",
+        "gemini-1.5-flash-latest",
+    ]
+    CHUNK = 8
     answers: list[str] = []
 
-    for i in range(0, len(items), CHUNK):
-        sub = items[i:i+CHUNK]
-        items_block = "\n".join(f"{j+1}. {q}" for j, q in enumerate(sub))
-        prompt = f"{base_prompt}\n\n# 設問\n{items_block}\n\n# OCRテキスト\n{_clamp(full_text)}"
+    base_prompt = (
+        "以下のOCRテキストから、与えた設問と同じ順序で回答だけを抽出してください。"
+        "該当回答が見当たらない設問は必ず \"N/A\" を返してください。"
+        "選択式・マトリクスは最終的な回答語のみ（例:「はい」「いいえ」「A」「B」「1回/週」など）。"
+        "数値は半角に正規化してください。"
+        "必須: 出力はJSONの文字列配列のみ。説明文・接頭辞・追加文字は禁止。"
+    )
 
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+    def _post_and_parse(model: str, prompt_text: str) -> list[str] | None:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         headers = {"Content-Type": "application/json"}
         payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
+            "contents": [{"parts": [{"text": prompt_text}]}],
             "generationConfig": {
-                "maxOutputTokens": 512,
+                "maxOutputTokens": 384,
                 "temperature": 0.1,
-                "response_mime_type": "application/json"
-            }
+                "response_mime_type": "application/json",
+            },
         }
-
+        r = requests.post(
+            url,
+            params={"key": os.environ["GEMINI_API_KEY"]},
+            headers=headers,
+            json=payload,
+            timeout=120,
+        )
+        r.raise_for_status()
+        data = r.json()
+        # 念のため candidates/parts の形の揺れに耐える
         try:
-            r = requests.post(url, params={"key": os.environ["GEMINI_API_KEY"]},
-                              headers=headers, json=payload, timeout=120)
-            r.raise_for_status()
-            text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception:
+            return None
+        # モデルが ```json ... ``` で返しても耐える
+        if text.startswith("```"):
+            text = text.strip("`")
+            # 先頭の "json" ラベルを除去
+            if text.lower().startswith("json"):
+                text = text[4:].lstrip()
+        try:
             arr = json.loads(text)
             if not isinstance(arr, list):
-                raise ValueError("Gemini output not list")
-            answers.extend(str(x) for x in arr)
-        except Exception as e:
-            print(f"[Gemini chunk error] {e}")
-            answers.extend(["N/A"] * len(sub))
+                return None
+            # 文字列化
+            return [str(x) if x is not None else "N/A" for x in arr]
+        except Exception:
+            return None
 
+    for i in range(0, len(items), CHUNK):
+        sub = items[i:i + CHUNK]
+        items_block = "\n".join(f"{j+1}. {q}" for j, q in enumerate(sub))
+        prompt = (
+            f"{base_prompt}\n\n"
+            f"# 設問\n{items_block}\n\n"
+            f"# OCRテキスト\n{_clamp(full_text)}"
+        )
+
+        result: list[str] | None = None
+        last_err: Exception | None = None
+        for model in MODELS:
+            try:
+                result = _post_and_parse(model, prompt)
+                if result is not None:
+                    break
+            except Exception as e:
+                last_err = e
+                print(f"[Gemini chunk error][{model}] {e}")
+                continue
+
+        if result is None:
+            # どのモデルでも失敗した場合はN/A埋め
+            answers.extend(["N/A"] * len(sub))
+        else:
+            # 配列長を設問数に合わせる
+            if len(result) < len(sub):
+                result += ["N/A"] * (len(sub) - len(result))
+            answers.extend(result[:len(sub)])
+
+    # 最後に全体長を items に合わせる
     if len(answers) < len(items):
         answers += ["N/A"] * (len(items) - len(answers))
     return answers[:len(items)]
+
 
 # ----------------------------------------------------------------
 # 4. Functions
@@ -276,16 +331,27 @@ def ocr_and_write_sheet(request):
                 fname = (f.filename or "").lower()
 
                 if "pdf" in mime or fname.endswith(".pdf"):
+                    
                     page_texts = ocr_pdf_pages_via_gcs_stream(f)
                     raw_text = "\n".join(page_texts)
                 else:
                     raw_text = ocr_image_inline(f.read())
+
+                print(f"[DEBUG][OCR] len={len(raw_text)}")
+                print(f"[DEBUG][OCR] head500={raw_text[:500].replace(os.linesep,' ')[:500]}")
 
                 row = call_gemini_for_row(raw_text, header_row)
                 if len(row) < len(header_row):
                     row += ["N/A"] * (len(header_row) - len(row))
                 row = row[:len(header_row)]
 
+                # デバッグ: 最初の1行だけ raw を末尾列で出す
+                out_row = row[:]
+                if appended == 0:
+                    try:
+                        out_row.append(f"DEBUG_RAW={json.dumps(row, ensure_ascii=False)[:500]}")
+                    except Exception:
+                        out_row.append("DEBUG_RAW=?")
                 sheet_api.append(
                     spreadsheetId=spreadsheet_id, range="A2",
                     valueInputOption="RAW", insertDataOption="INSERT_ROWS",
