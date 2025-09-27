@@ -62,19 +62,25 @@ def ocr_image_inline(file_bytes: bytes) -> str:
     return (resp.full_text_annotation.text or "").strip()
 
 def ocr_pdf_via_gcs(file_bytes: bytes) -> str:
-    """PDFをGCSへ一時置き→Vision 非同期OCR→JSON回収→全文テキスト"""
+    """PDF → GCS へ置く → Vision 非同期 → 出力JSONをjson.loadsで読む → 結合テキスト返却"""
     if not TEMP_BUCKET:
         raise RuntimeError("TEMP_BUCKET が設定されていません。")
 
-    pdf_name = f"upload-{int(time.time()*1000)}.pdf"
+    ts = int(time.time() * 1000)
+    src_name = f"uploads/{ts}.pdf"
+    out_prefix = f"vision-out/{ts}/"   # ← 重要：末尾のスラッシュ
+
     bucket = storage_client.bucket(TEMP_BUCKET)
-    src_blob = bucket.blob(pdf_name)
+
+    # 1) PDFアップロード
+    src_blob = bucket.blob(src_name)
     src_blob.upload_from_string(file_bytes, content_type="application/pdf")
+    gcs_src_uri = f"gs://{TEMP_BUCKET}/{src_name}"
+    print(f"[PDF OCR] uploaded: {gcs_src_uri}")
 
-    out_prefix = f"vision-out-{int(time.time()*1000)}"
+    # 2) Vision 非同期
     gcs_dst = vision.GcsDestination(uri=f"gs://{TEMP_BUCKET}/{out_prefix}")
-    gcs_src = vision.GcsSource(uri=f"gs://{TEMP_BUCKET}/{pdf_name}")
-
+    gcs_src = vision.GcsSource(uri=gcs_src_uri)
     feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
     input_config = vision.InputConfig(gcs_source=gcs_src, mime_type="application/pdf")
     output_config = vision.OutputConfig(gcs_destination=gcs_dst)
@@ -83,40 +89,44 @@ def ocr_pdf_via_gcs(file_bytes: bytes) -> str:
         features=[feature], input_config=input_config, output_config=output_config
     )
     op = vision_client.async_batch_annotate_files(requests=[req])
-    op.result(timeout=600)  # 最大10分
+    op.result(timeout=600)
+    print(f"[PDF OCR] async finished. output prefix: gs://{TEMP_BUCKET}/{out_prefix}")
+
+    # 3) 出力JSONを読む（複数あり得る）
+    blobs = list(storage_client.list_blobs(TEMP_BUCKET, prefix=out_prefix))
+    json_blobs = [b for b in blobs if b.name.endswith(".json")]
+    print(f"[PDF OCR] json files: {len(json_blobs)}")
+
+    if not json_blobs:
+        # Vision 側の出力が無い場合に早期通知
+        raise RuntimeError(f"OCR結果(JSON)が見つかりません: gs://{TEMP_BUCKET}/{out_prefix}")
 
     texts = []
-    for b in storage_client.list_blobs(TEMP_BUCKET, prefix=out_prefix):
-        if not b.name.endswith(".json"):
-            continue
-        contents = b.download_as_bytes()
-        resp = vision.AnnotateFileResponse.from_json(contents.decode("utf-8"))
-        for r in resp.responses:
-            if r.full_text_annotation and r.full_text_annotation.text:
-                texts.append(r.full_text_annotation.text)
+    for b in json_blobs:
+        data = json.loads(b.download_as_bytes())
+        for r in data.get("responses", []):
+            txt = r.get("fullTextAnnotation", {}).get("text", "")
+            if txt:
+                texts.append(txt)
 
-    # 後片付け（best-effort）
+    # 4) 掃除（best-effort）
     try:
         src_blob.delete()
-        for b in storage_client.list_blobs(TEMP_BUCKET, prefix=out_prefix):
+        for b in blobs:
             b.delete()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[PDF OCR] cleanup warning: {e}")
 
     return "\n".join(texts).strip()
 
 # ----------------------------------------------------------------
 # 4. Functions
 # ----------------------------------------------------------------
+def _clamp(s: str, max_chars: int = 120_000) -> str:
+    return s if len(s) <= max_chars else s[:max_chars]
+
 @functions_framework.http
 def analyze_survey_template(request):
-    """
-    見本（PDF/画像）をOCR→Geminiで質問項目抽出→Firestore保存
-    保存先: users/{uid}/templates/{template_name}
-      - items（改行区切り）
-      - spreadsheetId
-      - createdAt
-    """
     headers = {"Access-Control-Allow-Origin": "*"}
     if request.method == "OPTIONS":
         headers.update({
@@ -147,8 +157,9 @@ def analyze_survey_template(request):
 
         mime = (uploaded_file.mimetype or "").lower()
         fname = (uploaded_file.filename or "").lower()
+        print(f"[ANALYZE] file: {fname} ({mime}), size={len(file_bytes)}")
 
-        # OCR（PDF優先）
+        # --- OCR（PDF優先） ---
         if mime == "application/pdf" or fname.endswith(".pdf"):
             raw_text = ocr_pdf_via_gcs(file_bytes)
         else:
@@ -157,17 +168,35 @@ def analyze_survey_template(request):
         if not raw_text:
             raise ValueError("OCRでテキストを抽出できませんでした。")
 
-        # Gemini で質問リスト抽出
+        # --- Gemini へ渡すテキストを制限（過大入力での 4xx/5xx 防止）---
+        raw_for_gemini = _clamp(raw_text)
+
         model = genai.GenerativeModel("gemini-2.5-flash")
         prompt_for_questions = """
         あなたはアンケート設計を分析する専門家です。
         以下のOCRテキストから、回答欄に相当する質問項目のみを抽出してください。
         出力は改行区切りのリストとしてください。
         """
-        gresp = model.generate_content([prompt_for_questions, raw_text])
-        prompt_items = (gresp.text or "").strip()
+        gresp = model.generate_content([prompt_for_questions, raw_for_gemini])
 
-        # Firestore 保存
+        # gresp.text が空の場合のフォールバック
+        prompt_items = ""
+        if getattr(gresp, "text", None):
+            prompt_items = gresp.text.strip()
+        else:
+            try:
+                parts = []
+                for cand in getattr(gresp, "candidates", []) or []:
+                    for p in getattr(cand, "content", {}).parts or []:
+                        t = getattr(p, "text", "")
+                        if t:
+                            parts.append(t)
+                prompt_items = "\n".join(parts).strip()
+            except Exception as e:
+                print(f"[ANALYZE] gemini fallback parse failed: {e}")
+                prompt_items = ""
+
+        # --- 保存 ---
         ref = db.collection("users").document(uid).collection("templates").document(template_name)
         ref.set({
             "items": prompt_items,
@@ -180,7 +209,8 @@ def analyze_survey_template(request):
     except ValueError as e:
         return (str(e), 400, headers)
     except Exception as e:
-        print(f"テンプレート作成中にエラー: {e}")
+        # ここで “どの段階で失敗したか” が分かるようにログ出力を増やす
+        print(f"[ANALYZE][ERROR] {e}")
         return ("テンプレート作成中にエラーが発生しました。", 500, headers)
 
 @functions_framework.http
