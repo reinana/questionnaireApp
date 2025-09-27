@@ -121,103 +121,53 @@ def _clamp(s: str, max_chars: int = 20_000) -> str:
 
 def call_gemini_for_row(full_text: str, items: list[str]) -> list[str]:
     """
-    OCR全文から、設問リスト(items)の順に回答を抽出して返す。
-    - 設問を小分け(既定8問)で投げる
-    - モデルは pro-latest → flash-latest の順にフォールバック
-    - 出力は必ず items と同じ長さの文字列配列（不足は N/A で埋める）
+    OCR全文と設問（items）から、設問順の回答を JSON 配列で返す。
+    SDK(google.generativeai) を使うのでURL組み立て不要・v1beta/v1beta1差異も吸収。
     """
     if not items:
         return []
 
-    MODELS = [
-        "gemini-2.5-pro"
-    ]
+    import google.generativeai as genai
 
-    CHUNK = 8
-    answers: list[str] = []
-
+    MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"]  # 精度→速度のフォールバック
     base_prompt = (
         "以下のOCRテキストから、与えた設問と同じ順序で回答だけを抽出してください。"
-        "該当回答が見当たらない設問は必ず \"N/A\" を返してください。"
-        "選択式・マトリクスは最終的な回答語のみ（例:「はい」「いいえ」「A」「B」「1回/週」など）。"
-        "数値は半角に正規化してください。"
-        "必須: 出力はJSONの文字列配列のみ。説明文・接頭辞・追加文字は禁止。"
+        "出力は必ず JSON の文字列配列（例: [\"回答1\", \"回答2\", ...]）のみ。"
+        "見当たらない設問は \"N/A\"。選択式は選ばれた語のみ、数値は半角。"
     )
+    items_json = json.dumps(items, ensure_ascii=False)
+    prompt = f"{base_prompt}\n\n設問:\n{items_json}\n\nOCR:\n{_clamp(full_text)}"
 
-    def _post_and_parse(model: str, prompt_text: str) -> list[str] | None:
-        url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
-        headers = {"Content-Type": "application/json"}
-        payload = {
-            "contents": [{"parts": [{"text": prompt_text}]}],
-            "generationConfig": {
-                "maxOutputTokens": 384,
-                "temperature": 0.1,
-                "response_mime_type": "application/json",
-            },
-        }
-        r = requests.post(
-            url,
-            params={"key": os.environ["GEMINI_API_KEY"]},
-            headers=headers,
-            json=payload,
-            timeout=120,
-        )
-        r.raise_for_status()
-        data = r.json()
-        # 念のため candidates/parts の形の揺れに耐える
+    last_err = None
+    for m in MODELS:
         try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except Exception:
-            return None
-        # モデルが ```json ... ``` で返しても耐える
-        if text.startswith("```"):
-            text = text.strip("`")
-            # 先頭の "json" ラベルを除去
-            if text.lower().startswith("json"):
-                text = text[4:].lstrip()
-        try:
+            model = genai.GenerativeModel(m)
+            resp = model.generate_content(
+                prompt,
+                generation_config={
+                    "temperature": 0.1,
+                    "max_output_tokens": 768,
+                    "response_mime_type": "application/json",
+                },
+                request_options={"timeout": 120},
+            )
+            text = (getattr(resp, "text", "") or "").strip()
+            if text.startswith("```"):
+                text = text.strip("`")
+                if text.lower().startswith("json"):
+                    text = text[4:].lstrip()
             arr = json.loads(text)
-            if not isinstance(arr, list):
-                return None
-            # 文字列化
-            return [str(x) if x is not None else "N/A" for x in arr]
-        except Exception:
-            return None
+            if isinstance(arr, list):
+                # 列合わせ
+                if len(arr) < len(items):
+                    arr += ["N/A"] * (len(items) - len(arr))
+                return [str(x) if x is not None else "N/A" for x in arr[:len(items)]]
+        except Exception as e:
+            print(f"[Gemini SDK error][{m}] {e}")
+            last_err = e
 
-    for i in range(0, len(items), CHUNK):
-        sub = items[i:i + CHUNK]
-        items_block = "\n".join(f"{j+1}. {q}" for j, q in enumerate(sub))
-        prompt = (
-            f"{base_prompt}\n\n"
-            f"# 設問\n{items_block}\n\n"
-            f"# OCRテキスト\n{_clamp(full_text)}"
-        )
-
-        result: list[str] | None = None
-        last_err: Exception | None = None
-        for model in MODELS:
-            try:
-                result = _post_and_parse(model, prompt)
-                if result is not None:
-                    break
-            except Exception as e:
-                last_err = e
-                print(f"[Gemini chunk error][{model}] {e}")
-                continue
-
-        if result is None:
-            # どのモデルでも失敗した場合はN/A埋め
-            answers.extend(["N/A"] * len(sub))
-        else:
-            # 配列長を設問数に合わせる
-            if len(result) < len(sub):
-                result += ["N/A"] * (len(sub) - len(result))
-            answers.extend(result[:len(sub)])
-
-    # 最後に全体長を items に合わせる
-    if len(answers) < len(items):
-        answers += ["N/A"] * (len(items) - len(answers))
-    return answers[:len(items)]
+    print("[Gemini SDK fallback] returning N/A due to errors:", last_err)
+    return ["N/A"] * len(items)
 
 
 # ----------------------------------------------------------------
@@ -308,6 +258,9 @@ def ocr_and_write_sheet(request):
         if not tdoc.exists:
             raise ValueError("テンプレートが見つかりません。")
         tdata = tdoc.to_dict()
+
+        print("[RUN] ocr_and_write_sheet start; template=", template_name)
+        print("[RUN] GEMINI KEY exists?", bool(os.environ.get("GEMINI_API_KEY")))
 
         header_row = [q.strip() for q in (tdata.get("items") or "").splitlines() if q.strip()]
         spreadsheet_id = tdata.get("spreadsheetId")
