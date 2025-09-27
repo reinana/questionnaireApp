@@ -130,9 +130,10 @@ def call_gemini_for_row(full_text: str, items: list[str]) -> list[str]:
         return []
 
     MODELS = [
-        "gemini-1.5-pro-latest",
-        "gemini-1.5-flash-latest",
+        "gemini-1.5-pro",
+        "gemini-1.5-flash",
     ]
+
     CHUNK = 8
     answers: list[str] = []
 
