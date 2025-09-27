@@ -80,7 +80,7 @@ async function showSheetIdForTemplate(templateName) {
 
   try {
     const token = await getIdToken();
-    const res = await fetch(`${getSheetIdFunctionUrl}?template=${encodeURIComponent(templateName)}`, {
+    const res = await fetch(`${getSheetIdUrl}?template=${encodeURIComponent(templateName)}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     const data = await res.json();
