@@ -10,6 +10,8 @@ from flask import jsonify
 from google.cloud import vision, storage
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+import requests
 
 # ----------------------------------------------------------------
 # 2. init
@@ -27,7 +29,7 @@ genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 # Vision / Storage
 vision_client = vision.ImageAnnotatorClient()
 storage_client = storage.Client()
-TEMP_BUCKET = os.environ.get("TEMP_BUCKET")  # 例: questionnaire-app-472614-vision-tmp
+TEMP_BUCKET = os.environ.get("TEMP_BUCKET")
 
 # Sheets
 SERVICE_ACCOUNT_FILE = os.environ.get("SHEETS_SA_JSON", "credentials.json")
@@ -37,7 +39,7 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # 3. utils
 # ----------------------------------------------------------------
 def extract_spreadsheet_id(url: str) -> str:
-    """GoogleスプレッドシートURLからIDを抽出（URLでなければそのまま返す）"""
+    """GoogleスプレッドシートURLからIDを抽出"""
     if not url:
         return ""
     m = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
@@ -61,138 +63,6 @@ def ocr_image_inline(file_bytes: bytes) -> str:
         raise RuntimeError(f"Vision API error: {resp.error.message}")
     return (resp.full_text_annotation.text or "").strip()
 
-def ocr_pdf_via_gcs(file_bytes: bytes) -> str:
-    """PDF → GCS へ置く → Vision 非同期 → 出力JSONをjson.loadsで読む → 結合テキスト返却"""
-    if not TEMP_BUCKET:
-        raise RuntimeError("TEMP_BUCKET が設定されていません。")
-
-    ts = int(time.time() * 1000)
-    src_name = f"uploads/{ts}.pdf"
-    out_prefix = f"vision-out/{ts}/"   # ← 重要：末尾のスラッシュ
-
-    bucket = storage_client.bucket(TEMP_BUCKET)
-
-    # 1) PDFアップロード
-    src_blob = bucket.blob(src_name)
-    src_blob.upload_from_string(file_bytes, content_type="application/pdf")
-    gcs_src_uri = f"gs://{TEMP_BUCKET}/{src_name}"
-    print(f"[PDF OCR] uploaded: {gcs_src_uri}")
-
-    # 2) Vision 非同期
-    gcs_dst = vision.GcsDestination(uri=f"gs://{TEMP_BUCKET}/{out_prefix}")
-    gcs_src = vision.GcsSource(uri=gcs_src_uri)
-    feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
-    input_config = vision.InputConfig(gcs_source=gcs_src, mime_type="application/pdf")
-    output_config = vision.OutputConfig(gcs_destination=gcs_dst)
-
-    req = vision.AsyncAnnotateFileRequest(
-        features=[feature], input_config=input_config, output_config=output_config
-    )
-    op = vision_client.async_batch_annotate_files(requests=[req])
-    op.result(timeout=600)
-    print(f"[PDF OCR] async finished. output prefix: gs://{TEMP_BUCKET}/{out_prefix}")
-
-    # 3) 出力JSONを読む（複数あり得る）
-    blobs = list(storage_client.list_blobs(TEMP_BUCKET, prefix=out_prefix))
-    json_blobs = [b for b in blobs if b.name.endswith(".json")]
-    print(f"[PDF OCR] json files: {len(json_blobs)}")
-
-    if not json_blobs:
-        # Vision 側の出力が無い場合に早期通知
-        raise RuntimeError(f"OCR結果(JSON)が見つかりません: gs://{TEMP_BUCKET}/{out_prefix}")
-
-    texts = []
-    for b in json_blobs:
-        data = json.loads(b.download_as_bytes().decode("utf-8"))
-        for r in data.get("responses", []):
-            txt = r.get("fullTextAnnotation", {}).get("text", "")
-            if txt:
-                texts.append(txt)
-
-    # 4) 掃除（best-effort）
-    try:
-        src_blob.delete()
-        for b in blobs:
-            b.delete()
-    except Exception as e:
-        print(f"[PDF OCR] cleanup warning: {e}")
-
-    return "\n".join(texts).strip()
-
-# 文字数を上限でカット
-def _clamp(s: str, max_chars: int = 20_000) -> str:
-    return s if len(s) <= max_chars else s[:max_chars]
-
-# Gemini呼び出しをリトライ付きで
-def gen_content_with_retry(model, parts, tries: int = 3, timeout_s: int = 60):
-    last_err = None
-    for i in range(tries):
-        try:
-            return model.generate_content(parts, request_options={"timeout": timeout_s})
-        except Exception as e:
-            last_err = e
-            time.sleep(1 * (2 ** i))  # 1s, 2s, 4s
-    raise last_err
-
-
-
-def ocr_pdf_pages_via_gcs(file_bytes: bytes) -> list[str]:
-    """PDF→GCS→Vision 非同期OCR。ページごとのテキスト配列を返す。"""
-    if not TEMP_BUCKET:
-        raise RuntimeError("TEMP_BUCKET が設定されていません。")
-
-    ts = int(time.time() * 1000)
-    src_name   = f"uploads/{ts}.pdf"
-    out_prefix = f"vision-out/{ts}/"  # 末尾スラッシュ重要
-
-    bucket = storage_client.bucket(TEMP_BUCKET)
-    src_blob = bucket.blob(src_name)
-    src_blob.upload_from_string(file_bytes, content_type="application/pdf")
-    print(f"[PDF OCR] uploaded: gs://{TEMP_BUCKET}/{src_name}")
-
-    gcs_src = vision.GcsSource(uri=f"gs://{TEMP_BUCKET}/{src_name}")
-    gcs_dst = vision.GcsDestination(uri=f"gs://{TEMP_BUCKET}/{out_prefix}")
-
-    feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
-    input_config  = vision.InputConfig(gcs_source=gcs_src, mime_type="application/pdf")
-    output_config = vision.OutputConfig(gcs_destination=gcs_dst)
-
-    req = vision.AsyncAnnotateFileRequest(
-        features=[feature], input_config=input_config, output_config=output_config
-    )
-    op = vision_client.async_batch_annotate_files(requests=[req])
-    op.result(timeout=600)
-    print(f"[PDF OCR] async finished. output prefix: gs://{TEMP_BUCKET}/{out_prefix}")
-
-    blobs = list(storage_client.list_blobs(TEMP_BUCKET, prefix=out_prefix))
-    json_blobs = [b for b in blobs if b.name.endswith(".json")]
-    print(f"[PDF OCR] json files: {len(json_blobs)}")
-    if not json_blobs:
-        raise RuntimeError(f"OCR結果(JSON)が見つかりません: gs://{TEMP_BUCKET}/{out_prefix}")
-
-    pages: list[str] = []
-    for b in json_blobs:
-        data = json.loads(b.download_as_bytes().decode("utf-8"))
-        for r in data.get("responses", []):
-            txt = r.get("fullTextAnnotation", {}).get("text", "")
-            if txt:
-                pages.append(txt)
-
-    if os.environ.get("KEEP_VISION_OUTPUT") != "1":
-        try:
-            src_blob.delete()
-            for b in blobs: b.delete()
-        except Exception as e:
-            print(f"[PDF OCR] cleanup warn: {e}")
-
-    return pages
-
-def is_pdf_upload(file_storage) -> bool:
-    mime = (file_storage.mimetype or "").lower()
-    name = (file_storage.filename or "").lower()
-    return ("pdf" in mime) or name.endswith(".pdf")
-
-# PDF のときは bytes を読まず、そのまま GCS にストリーム転送
 def ocr_pdf_pages_via_gcs_stream(file_storage) -> list[str]:
     """
     Flaskの FileStorage を受け取り、GCSにストリームでアップロードして Vision OCR。
@@ -203,12 +73,10 @@ def ocr_pdf_pages_via_gcs_stream(file_storage) -> list[str]:
 
     ts = int(time.time() * 1000)
     src_name   = f"uploads/{ts}.pdf"
-    out_prefix = f"vision-out/{ts}/"  # 末尾スラッシュ
+    out_prefix = f"vision-out/{ts}/"
 
     bucket = storage_client.bucket(TEMP_BUCKET)
     src_blob = bucket.blob(src_name)
-
-    # ★ここがポイント：read()しない。ストリームをそのまま渡す
     src_blob.upload_from_file(file_storage.stream, content_type="application/pdf", rewind=True)
     print(f"[PDF OCR] uploaded: gs://{TEMP_BUCKET}/{src_name}")
 
@@ -228,7 +96,6 @@ def ocr_pdf_pages_via_gcs_stream(file_storage) -> list[str]:
 
     blobs = list(storage_client.list_blobs(TEMP_BUCKET, prefix=out_prefix))
     json_blobs = [b for b in blobs if b.name.endswith(".json")]
-    print(f"[PDF OCR] json files: {len(json_blobs)}")
     if not json_blobs:
         raise RuntimeError(f"OCR結果(JSON)が見つかりません: gs://{TEMP_BUCKET}/{out_prefix}")
 
@@ -240,21 +107,67 @@ def ocr_pdf_pages_via_gcs_stream(file_storage) -> list[str]:
             if txt:
                 texts.append(txt)
 
-    if os.environ.get("KEEP_VISION_OUTPUT") != "1":
-        try:
-            src_blob.delete()
-            for b in blobs: b.delete()
-        except Exception as e:
-            print(f"[PDF OCR] cleanup warn: {e}")
+    # cleanup
+    try:
+        src_blob.delete()
+        for b in blobs: b.delete()
+    except Exception as e:
+        print(f"[PDF OCR] cleanup warn: {e}")
 
     return texts
+
+def _clamp(s: str, max_chars: int = 20_000) -> str:
+    return s if len(s) <= max_chars else s[:max_chars]
+
+def call_gemini_for_row(full_text: str, items: list[str]) -> list[str]:
+    """
+    OCR全文から、設問リスト順の回答配列を返す。
+    設問を小分けにしてGeminiへ投げ、JSON配列で受け取る。
+    """
+    base_prompt = (
+        "以下のOCR全文から、与えた設問の回答だけを抽出してください。"
+        "回答が見当たらない場合は \"N/A\" を返してください。"
+        "必ず JSON の文字列配列のみを返してください。"
+    )
+    CHUNK = 15
+    answers: list[str] = []
+
+    for i in range(0, len(items), CHUNK):
+        sub = items[i:i+CHUNK]
+        items_block = "\n".join(f"{j+1}. {q}" for j, q in enumerate(sub))
+        prompt = f"{base_prompt}\n\n# 設問\n{items_block}\n\n# OCRテキスト\n{_clamp(full_text)}"
+
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": 512,
+                "temperature": 0.1,
+                "response_mime_type": "application/json"
+            }
+        }
+
+        try:
+            r = requests.post(url, params={"key": os.environ["GEMINI_API_KEY"]},
+                              headers=headers, json=payload, timeout=120)
+            r.raise_for_status()
+            text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            arr = json.loads(text)
+            if not isinstance(arr, list):
+                raise ValueError("Gemini output not list")
+            answers.extend(str(x) for x in arr)
+        except Exception as e:
+            print(f"[Gemini chunk error] {e}")
+            answers.extend(["N/A"] * len(sub))
+
+    if len(answers) < len(items):
+        answers += ["N/A"] * (len(items) - len(answers))
+    return answers[:len(items)]
 
 # ----------------------------------------------------------------
 # 4. Functions
 # ----------------------------------------------------------------
-def _clamp(s: str, max_chars: int = 120_000) -> str:
-    return s if len(s) <= max_chars else s[:max_chars]
-
 @functions_framework.http
 def analyze_survey_template(request):
     headers = {"Access-Control-Allow-Origin": "*"}
@@ -270,83 +183,53 @@ def analyze_survey_template(request):
         uid = verify_token(request)
 
         template_name = (request.form.get("template_name") or "").strip()
-        if not template_name:
-            raise ValueError("テンプレート名が指定されていません。")
-
         spreadsheet_url = (request.form.get("spreadsheet_url") or "").strip()
-        if not spreadsheet_url:
-            raise ValueError("スプレッドシートURLが指定されていません。")
-        spreadsheet_id = extract_spreadsheet_id(spreadsheet_url)
-
         uploaded_file = request.files.get("file")
-        if not uploaded_file:
-            raise ValueError("ファイルが含まれていません。")
-        file_bytes = uploaded_file.read()
-        if not file_bytes:
-            raise ValueError("アップロードされたファイルが空でした。")
 
-        mime  = (uploaded_file.mimetype or "")
-        fname = (uploaded_file.filename or "")
-        print(f"[ANALYZE] file: {fname} ({mime}), size={len(file_bytes)}")
+        if not template_name or not spreadsheet_url or not uploaded_file:
+            raise ValueError("必要な入力が不足しています。")
 
-        # --- OCR ---
-        
-        if "pdf" in mime or fname.endswith(".pdf"):
-            page_texts = ocr_pdf_pages_via_gcs_stream(uploaded_file)   # ← ストリーム版に変更
-        else:
-            file_bytes = uploaded_file.read()  # 画像は小さいのでOK
-            page_texts = [ocr_image_inline(file_bytes)]
+        spreadsheet_id = extract_spreadsheet_id(spreadsheet_url)
+        page_texts = (
+            ocr_pdf_pages_via_gcs_stream(uploaded_file)
+            if "pdf" in (uploaded_file.mimetype or "").lower()
+            else [ocr_image_inline(uploaded_file.read())]
+        )
 
-        # --- Geminiでページごとに抽出 → 重複除去して集約 ---
+        # Geminiで設問抽出
         model = genai.GenerativeModel("gemini-2.5-flash")
         prompt = (
             "あなたはアンケート設計を分析する専門家です。"
             "以下のOCRテキストから、回答欄に相当する質問項目のみを抽出し、"
-            "各行1項目、改行区切りのプレーンテキストで出力してください。"
-            "設問番号(例: 問1, Q2, 1.)が付いていれば残してください。"
+            "各行1項目、改行区切りで出力してください。"
         )
 
         items: list[str] = []
         seen = set()
-        for i, page in enumerate(page_texts, 1):
-            chunk = _clamp(page, 20_000)  # 小さめに
-            try:
-                g = gen_content_with_retry(model, [prompt, chunk], tries=3, timeout_s=60)
-                text = (getattr(g, "text", "") or "").strip()
-            except Exception as e:
-                print(f"[ANALYZE] gemini page {i} error: {e}")
-                continue
-
-            for line in (text.splitlines() if text else []):
+        for page in page_texts:
+            g = model.generate_content([prompt, _clamp(page)])
+            text = (getattr(g, "text", "") or "").strip()
+            for line in text.splitlines():
                 line = line.strip()
                 if line and line not in seen:
                     seen.add(line)
                     items.append(line)
 
-        prompt_items = "\n".join(items)
-
         ref = db.collection("users").document(uid).collection("templates").document(template_name)
         ref.set({
-            "items": prompt_items,
+            "items": "\n".join(items),
             "spreadsheetId": spreadsheet_id,
             "createdAt": firestore.SERVER_TIMESTAMP,
         })
 
         return (f"テンプレート「{template_name}」を作成しました。", 200, headers)
 
-    except ValueError as e:
-        return (str(e), 400, headers)
     except Exception as e:
         print(f"[ANALYZE][ERROR] {e}")
         return ("テンプレート作成中にエラーが発生しました。", 500, headers)
 
 @functions_framework.http
 def ocr_and_write_sheet(request):
-    """
-    テンプレートを使って複数ファイル（PDF/画像）から回答抽出→Sheetsへ書込
-    1行目: ヘッダ（質問項目）
-    2行目以降: 回答
-    """
     headers = {"Access-Control-Allow-Origin": "*"}
     if request.method == "OPTIONS":
         headers.update({
@@ -358,97 +241,69 @@ def ocr_and_write_sheet(request):
 
     try:
         uid = verify_token(request)
-
         template_name = (request.form.get("template_name") or "").strip()
-        if not template_name:
-            raise ValueError("テンプレート名が指定されていません。")
-
-        # 入力ファイル
         uploaded_files = request.files.getlist("files")
-        if not uploaded_files:
-            raise ValueError("ファイルが含まれていません。")
+
+        if not template_name or not uploaded_files:
+            raise ValueError("必要な入力が不足しています。")
 
         # テンプレート取得
         tref = db.collection("users").document(uid).collection("templates").document(template_name)
         tdoc = tref.get()
         if not tdoc.exists:
-            raise ValueError(f"テンプレート「{template_name}」が見つかりません。")
+            raise ValueError("テンプレートが見つかりません。")
         tdata = tdoc.to_dict()
 
         header_row = [q.strip() for q in (tdata.get("items") or "").splitlines() if q.strip()]
         spreadsheet_id = tdata.get("spreadsheetId")
-        if not spreadsheet_id:
-            raise ValueError("テンプレートに紐付いたスプレッドシートIDが存在しません。")
 
-        # Sheets クライアント
         creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
         sheets = build("sheets", "v4", credentials=creds)
+        sheet_api = sheets.spreadsheets().values()
 
-        # ヘッダ行を書き込み
-        sheets.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id, range="A1",
-            valueInputOption="RAW",
-            body={"values": [header_row]},
-        ).execute()
+        # ヘッダがなければ書き込む
+        existing = sheet_api.get(spreadsheetId=spreadsheet_id, range="A1:Z1").execute()
+        if "values" not in existing:
+            sheet_api.update(
+                spreadsheetId=spreadsheet_id, range="A1",
+                valueInputOption="RAW", body={"values": [header_row]}
+            ).execute()
 
-        rows = []
+        appended, failed = 0, 0
         for f in uploaded_files:
-            fb = f.read()
-            if not fb:
-                rows.append(["N/A"] * len(header_row))
-                continue
+            try:
+                mime = (f.mimetype or "").lower()
+                fname = (f.filename or "").lower()
 
-            mime = (f.mimetype or "").lower()
-            fname = (f.filename or "").lower()
-            # OCR
-            if "pdf" in mime or fname.endswith(".pdf"):
-                page_texts = ocr_pdf_pages_via_gcs_stream(f)  # ← ストリーム版
-                raw_text = "\n".join(page_texts)
-            else:
-                img_bytes = f.read()
-                raw_text = ocr_image_inline(img_bytes)
+                if "pdf" in mime or fname.endswith(".pdf"):
+                    page_texts = ocr_pdf_pages_via_gcs_stream(f)
+                    raw_text = "\n".join(page_texts)
+                else:
+                    raw_text = ocr_image_inline(f.read())
 
-            # Gemini で回答抽出（CSV 1行）
-            model = genai.GenerativeModel("gemini-2.5-flash")
-            prompt = f"""
-            あなたはOCRで抽出したアンケート回答を整理するAIです。
-            次の質問リスト順に、OCR結果から対応する回答だけを取り出し、
-            CSV 1行（回答1,回答2,...）で返してください。見つからない箇所は N/A としてください。
-
-            質問リスト:
-            {os.linesep.join(header_row)}
-
-            OCR結果:
-            {raw_text}
-            """
-            g = model.generate_content(prompt)
-            csv_line = (g.text or "").strip()
-            row = [c.strip() for c in csv_line.split(",")]
-            # 列数をヘッダに合わせる（不足はN/A、超過は切り捨て）
-            if len(row) < len(header_row):
-                row += ["N/A"] * (len(header_row) - len(row))
-            else:
+                row = call_gemini_for_row(raw_text, header_row)
+                if len(row) < len(header_row):
+                    row += ["N/A"] * (len(header_row) - len(row))
                 row = row[:len(header_row)]
-            rows.append(row)
 
-        # 回答追記
-        sheets.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id, range="A2",
-            valueInputOption="RAW",
-            body={"values": rows},
-        ).execute()
+                sheet_api.append(
+                    spreadsheetId=spreadsheet_id, range="A2",
+                    valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+                    body={"values": [row]}
+                ).execute()
+                appended += 1
+            except Exception as e:
+                print(f"[Process error] {e}")
+                failed += 1
 
-        return (f"{len(uploaded_files)}件のファイルを処理し、スプレッドシートに書き込みました！", 200, headers)
+        return (json.dumps({"ok": True, "appended": appended, "failed": failed}), 200, headers)
 
-    except ValueError as e:
-        return (str(e), 400, headers)
     except Exception as e:
-        print(f"データ抽出中にエラー: {e}")
+        print(f"[WRITE][ERROR] {e}")
         return ("データ抽出中にエラーが発生しました。", 500, headers)
 
 @functions_framework.http
 def get_sheet_id(request):
-    """指定テンプレートに保存してある spreadsheetId を返す（?template=...）"""
     headers = {"Access-Control-Allow-Origin": "*"}
     if request.method == "OPTIONS":
         headers.update({
@@ -461,19 +316,15 @@ def get_sheet_id(request):
     try:
         uid = verify_token(request)
         template_name = request.args.get("template", "").strip()
-        if not template_name:
-            raise ValueError("テンプレート名が指定されていません。")
 
         ref = db.collection("users").document(uid).collection("templates").document(template_name)
         doc = ref.get()
         if not doc.exists:
-            raise ValueError(f"テンプレート「{template_name}」が見つかりません。")
+            raise ValueError("テンプレートが見つかりません。")
 
         spreadsheet_id = (doc.to_dict() or {}).get("spreadsheetId")
         return (jsonify({"spreadsheetId": spreadsheet_id}), 200, headers)
 
-    except ValueError as e:
-        return (str(e), 400, headers)
     except Exception as e:
-        print(f"シートID取得中にエラー: {e}")
+        print(f"[GET_SHEET_ID][ERROR] {e}")
         return ("シートID取得中にエラーが発生しました。", 500, headers)
