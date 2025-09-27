@@ -1,20 +1,19 @@
 # ----------------------------------------------------------------
-# 1. 必要なライブラリをすべてインポート
+# 1. imports
 # ----------------------------------------------------------------
-import os
-import re
+import os, re, time
 import functions_framework
 import firebase_admin
 from firebase_admin import auth, firestore
 import google.generativeai as genai
 from flask import jsonify
-from google.cloud import vision
-
+from google.cloud import vision, storage
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 # ----------------------------------------------------------------
-# 2. 初期化と設定
+# 2. init
 # ----------------------------------------------------------------
-# Firebase Admin SDKを初期化
 try:
     firebase_admin.get_app()
 except ValueError:
@@ -22,58 +21,101 @@ except ValueError:
 
 db = firestore.client()
 
-# Gemini APIキーを環境変数から設定
+# Gemini
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-# Google Cloud Visionクライアントを初期化
-vision_client = vision.ImageAnnotatorClient()
 
+# Vision / Storage
+vision_client = vision.ImageAnnotatorClient()
+storage_client = storage.Client()
+TEMP_BUCKET = os.environ.get("TEMP_BUCKET")  # 例: questionnaire-app-472614-vision-tmp
+
+# Sheets
+SERVICE_ACCOUNT_FILE = os.environ.get("SHEETS_SA_JSON", "credentials.json")
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # ----------------------------------------------------------------
-# ユーティリティ関数
+# 3. utils
 # ----------------------------------------------------------------
 def extract_spreadsheet_id(url: str) -> str:
-    """
-    GoogleスプレッドシートのURLからIDを抽出する。
-    """
-    pattern = r"/d/([a-zA-Z0-9-_]+)"
-    match = re.search(pattern, url)
-    if match:
-        return match.group(1)
-    return url.strip()
+    """GoogleスプレッドシートURLからIDを抽出（URLでなければそのまま返す）"""
+    if not url:
+        return ""
+    m = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
+    return m.group(1) if m else url.strip()
 
-def verify_token(request):
-    """
-    Authorization ヘッダから ID トークンを検証し、uid を返す。
-    """
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
+def verify_token(request) -> str:
+    """Authorization: Bearer <idToken> 検証して uid を返す"""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
         raise ValueError("認証トークンがありません。")
-    id_token = auth_header.split("Bearer ")[1]
-    decoded_token = auth.verify_id_token(id_token)
-    return decoded_token["uid"]
+    id_token = auth_header.split(" ", 1)[1]
+    decoded = auth.verify_id_token(id_token)
+    return decoded["uid"]
 
-def extract_text_with_vision(file_data: bytes, mime_type: str) -> str:
-    """
-    Google Cloud Vision API を使って画像/PDFからテキストを抽出する。
-    """
-    image = vision.Image(content=file_data)
-    response = vision_client.document_text_detection(image=image)
-    
-    if response.error.message:
-        raise RuntimeError(f"Vision API error: {response.error.message}")
+def ocr_image_inline(file_bytes: bytes) -> str:
+    """画像（JPEG/PNG等）を Vision 同期OCR"""
+    img = vision.Image(content=file_bytes)
+    resp = vision_client.document_text_detection(image=img)
+    if resp.error.message:
+        print(f"[VisionError] {resp.error.message}")
+        raise RuntimeError(f"Vision API error: {resp.error.message}")
+    return (resp.full_text_annotation.text or "").strip()
 
-    return response.full_text_annotation.text.strip()
+def ocr_pdf_via_gcs(file_bytes: bytes) -> str:
+    """PDFをGCSへ一時置き→Vision 非同期OCR→JSON回収→全文テキスト"""
+    if not TEMP_BUCKET:
+        raise RuntimeError("TEMP_BUCKET が設定されていません。")
 
+    pdf_name = f"upload-{int(time.time()*1000)}.pdf"
+    bucket = storage_client.bucket(TEMP_BUCKET)
+    src_blob = bucket.blob(pdf_name)
+    src_blob.upload_from_string(file_bytes, content_type="application/pdf")
+
+    out_prefix = f"vision-out-{int(time.time()*1000)}"
+    gcs_dst = vision.GcsDestination(uri=f"gs://{TEMP_BUCKET}/{out_prefix}")
+    gcs_src = vision.GcsSource(uri=f"gs://{TEMP_BUCKET}/{pdf_name}")
+
+    feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
+    input_config = vision.InputConfig(gcs_source=gcs_src, mime_type="application/pdf")
+    output_config = vision.OutputConfig(gcs_destination=gcs_dst)
+
+    req = vision.AsyncAnnotateFileRequest(
+        features=[feature], input_config=input_config, output_config=output_config
+    )
+    op = vision_client.async_batch_annotate_files(requests=[req])
+    op.result(timeout=600)  # 最大10分
+
+    texts = []
+    for b in storage_client.list_blobs(TEMP_BUCKET, prefix=out_prefix):
+        if not b.name.endswith(".json"):
+            continue
+        contents = b.download_as_bytes()
+        resp = vision.AnnotateFileResponse.from_json(contents.decode("utf-8"))
+        for r in resp.responses:
+            if r.full_text_annotation and r.full_text_annotation.text:
+                texts.append(r.full_text_annotation.text)
+
+    # 後片付け（best-effort）
+    try:
+        src_blob.delete()
+        for b in storage_client.list_blobs(TEMP_BUCKET, prefix=out_prefix):
+            b.delete()
+    except Exception:
+        pass
+
+    return "\n".join(texts).strip()
 
 # ----------------------------------------------------------------
-# 司令塔A: テンプレート分析 (Vision + Gemini)
+# 4. Functions
 # ----------------------------------------------------------------
 @functions_framework.http
 def analyze_survey_template(request):
     """
-    単一のアンケート見本画像/PDFから質問項目を抽出し、
-    テンプレートとしてFirestoreに保存する。
-    Vision APIでOCR → Geminiで項目抽出。
+    見本（PDF/画像）をOCR→Geminiで質問項目抽出→Firestore保存
+    保存先: users/{uid}/templates/{template_name}
+      - items（改行区切り）
+      - spreadsheetId
+      - createdAt
     """
     headers = {"Access-Control-Allow-Origin": "*"}
     if request.method == "OPTIONS":
@@ -85,55 +127,49 @@ def analyze_survey_template(request):
         return ("", 204, headers)
 
     try:
-        # --- 認証 ---
         uid = verify_token(request)
 
-        # --- 入力チェック ---
-        template_name = request.form.get("template_name")
+        template_name = (request.form.get("template_name") or "").strip()
         if not template_name:
             raise ValueError("テンプレート名が指定されていません。")
 
-        spreadsheet_url = request.form.get("spreadsheet_url")
+        spreadsheet_url = (request.form.get("spreadsheet_url") or "").strip()
         if not spreadsheet_url:
             raise ValueError("スプレッドシートURLが指定されていません。")
-
         spreadsheet_id = extract_spreadsheet_id(spreadsheet_url)
 
         uploaded_file = request.files.get("file")
         if not uploaded_file:
             raise ValueError("ファイルが含まれていません。")
-
         file_bytes = uploaded_file.read()
+        if not file_bytes:
+            raise ValueError("アップロードされたファイルが空でした。")
 
-        # --- Step1: VisionでOCR ---
-        vision_client = vision.ImageAnnotatorClient()
-        image = vision.Image(content=file_bytes)
-        response = vision_client.document_text_detection(image=image)
-        if response.error.message:
-            raise RuntimeError(f"Vision API error: {response.error.message}")
+        mime = (uploaded_file.mimetype or "").lower()
+        fname = (uploaded_file.filename or "").lower()
 
-        raw_text = response.full_text_annotation.text.strip()
+        # OCR（PDF優先）
+        if mime == "application/pdf" or fname.endswith(".pdf"):
+            raw_text = ocr_pdf_via_gcs(file_bytes)
+        else:
+            raw_text = ocr_image_inline(file_bytes)
+
         if not raw_text:
             raise ValueError("OCRでテキストを抽出できませんでした。")
 
-        # --- Step2: Geminiで質問項目を抽出 ---
+        # Gemini で質問リスト抽出
         model = genai.GenerativeModel("gemini-2.5-flash")
         prompt_for_questions = """
         あなたはアンケート設計を分析する専門家です。
         以下のOCRテキストから、回答欄に相当する質問項目のみを抽出してください。
         出力は改行区切りのリストとしてください。
         """
-        gemini_response = model.generate_content([prompt_for_questions, raw_text])
-        prompt_items = gemini_response.text.strip()
+        gresp = model.generate_content([prompt_for_questions, raw_text])
+        prompt_items = (gresp.text or "").strip()
 
-        # --- Firestoreへ保存 ---
-        template_doc_ref = (
-            db.collection("users")
-            .document(uid)
-            .collection("templates")
-            .document(template_name)
-        )
-        template_doc_ref.set({
+        # Firestore 保存
+        ref = db.collection("users").document(uid).collection("templates").document(template_name)
+        ref.set({
             "items": prompt_items,
             "spreadsheetId": spreadsheet_id,
             "createdAt": firestore.SERVER_TIMESTAMP,
@@ -147,16 +183,12 @@ def analyze_survey_template(request):
         print(f"テンプレート作成中にエラー: {e}")
         return ("テンプレート作成中にエラーが発生しました。", 500, headers)
 
-# ----------------------------------------------------------------
-# 司令塔B: データ抽出実行官 (Vision + Gemini, ヘッダ行あり)
-# ----------------------------------------------------------------
 @functions_framework.http
 def ocr_and_write_sheet(request):
     """
-    指定されたテンプレートを使い、複数のアンケート画像/PDFから
-    回答を抽出し、指定されたGoogleスプレッドシートに書き込む。
-    VisionでOCR → Geminiで回答抽出。
-    1行目に質問リストをヘッダとして出力する。
+    テンプレートを使って複数ファイル（PDF/画像）から回答抽出→Sheetsへ書込
+    1行目: ヘッダ（質問項目）
+    2行目以降: 回答
     """
     headers = {"Access-Control-Allow-Origin": "*"}
     if request.method == "OPTIONS":
@@ -168,68 +200,61 @@ def ocr_and_write_sheet(request):
         return ("", 204, headers)
 
     try:
-        # --- 認証 ---
         uid = verify_token(request)
 
-        # --- 入力チェック ---
-        template_name = request.form.get("template_name")
+        template_name = (request.form.get("template_name") or "").strip()
         if not template_name:
             raise ValueError("テンプレート名が指定されていません。")
 
+        # 入力ファイル
         uploaded_files = request.files.getlist("files")
         if not uploaded_files:
             raise ValueError("ファイルが含まれていません。")
 
-        # --- Firestoreからテンプレート取得 ---
-        template_doc_ref = (
-            db.collection("users").document(uid).collection("templates").document(template_name)
-        )
-        template_doc = template_doc_ref.get()
-        if not template_doc.exists:
+        # テンプレート取得
+        tref = db.collection("users").document(uid).collection("templates").document(template_name)
+        tdoc = tref.get()
+        if not tdoc.exists:
             raise ValueError(f"テンプレート「{template_name}」が見つかりません。")
+        tdata = tdoc.to_dict()
 
-        template_data = template_doc.to_dict()
-        prompt_items = template_data["items"].splitlines()
-        spreadsheet_id = template_data.get("spreadsheetId")
+        header_row = [q.strip() for q in (tdata.get("items") or "").splitlines() if q.strip()]
+        spreadsheet_id = tdata.get("spreadsheetId")
         if not spreadsheet_id:
             raise ValueError("テンプレートに紐付いたスプレッドシートIDが存在しません。")
 
-        # --- Google Sheets API 初期化 ---
-        creds = service_account.Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE, scopes=SCOPES
-        )
-        sheets_service = build("sheets", "v4", credentials=creds)
+        # Sheets クライアント
+        creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        sheets = build("sheets", "v4", credentials=creds)
 
-        # --- まずヘッダ行を書き込み（質問リスト） ---
-        header_row = [q.strip() for q in prompt_items if q.strip()]
-        sheets_service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range="A1",
+        # ヘッダ行を書き込み
+        sheets.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id, range="A1",
             valueInputOption="RAW",
             body={"values": [header_row]},
         ).execute()
 
-        # --- Vision + Gemini で各ファイルを処理 ---
-        rows_to_insert = []
-        for file in uploaded_files:
-            file_bytes = file.read()
+        rows = []
+        for f in uploaded_files:
+            fb = f.read()
+            if not fb:
+                rows.append(["N/A"] * len(header_row))
+                continue
 
-            # Step1: Vision OCR
-            vision_client = vision.ImageAnnotatorClient()
-            image = vision.Image(content=file_bytes)
-            response = vision_client.document_text_detection(image=image)
-            if response.error.message:
-                raise RuntimeError(f"Vision API error: {response.error.message}")
+            mime = (f.mimetype or "").lower()
+            fname = (f.filename or "").lower()
+            # OCR
+            if mime == "application/pdf" or fname.endswith(".pdf"):
+                raw_text = ocr_pdf_via_gcs(fb)
+            else:
+                raw_text = ocr_image_inline(fb)
 
-            raw_text = response.full_text_annotation.text.strip()
-
-            # Step2: Geminiで回答抽出
+            # Gemini で回答抽出（CSV 1行）
             model = genai.GenerativeModel("gemini-2.5-flash")
-            prompt_for_answers = f"""
+            prompt = f"""
             あなたはOCRで抽出したアンケート回答を整理するAIです。
-            以下の質問リストに基づき、OCR結果から対応する回答を抜き出してください。
-            回答が見つからない場合は「N/A」としてください。
-            出力は質問リストと同じ順序で、CSV形式（回答1,回答2,...）としてください。
+            次の質問リスト順に、OCR結果から対応する回答だけを取り出し、
+            CSV 1行（回答1,回答2,...）で返してください。見つからない箇所は N/A としてください。
 
             質問リスト:
             {os.linesep.join(header_row)}
@@ -237,20 +262,21 @@ def ocr_and_write_sheet(request):
             OCR結果:
             {raw_text}
             """
-            gemini_response = model.generate_content(prompt_for_answers)
-            answers_csv = gemini_response.text.strip()
+            g = model.generate_content(prompt)
+            csv_line = (g.text or "").strip()
+            row = [c.strip() for c in csv_line.split(",")]
+            # 列数をヘッダに合わせる（不足はN/A、超過は切り捨て）
+            if len(row) < len(header_row):
+                row += ["N/A"] * (len(header_row) - len(row))
+            else:
+                row = row[:len(header_row)]
+            rows.append(row)
 
-            # CSV文字列 → リスト化
-            row = [ans.strip() for ans in answers_csv.split(",")]
-            rows_to_insert.append(row)
-
-        # --- 回答を2行目以降に追記 ---
-        body = {"values": rows_to_insert}
-        sheets_service.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id,
-            range="A2",
+        # 回答追記
+        sheets.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id, range="A2",
             valueInputOption="RAW",
-            body=body,
+            body={"values": rows},
         ).execute()
 
         return (f"{len(uploaded_files)}件のファイルを処理し、スプレッドシートに書き込みました！", 200, headers)
@@ -261,16 +287,9 @@ def ocr_and_write_sheet(request):
         print(f"データ抽出中にエラー: {e}")
         return ("データ抽出中にエラーが発生しました。", 500, headers)
 
-
-# ----------------------------------------------------------------
-# 司令塔C: シートID確認用API
-# ----------------------------------------------------------------
 @functions_framework.http
 def get_sheet_id(request):
-    """
-    指定されたテンプレートに紐づくシートIDを返す。
-    クエリパラメータ: ?template=テンプレート名
-    """
+    """指定テンプレートに保存してある spreadsheetId を返す（?template=...）"""
     headers = {"Access-Control-Allow-Origin": "*"}
     if request.method == "OPTIONS":
         headers.update({
@@ -282,24 +301,16 @@ def get_sheet_id(request):
 
     try:
         uid = verify_token(request)
-
-        template_name = request.args.get("template")
+        template_name = request.args.get("template", "").strip()
         if not template_name:
             raise ValueError("テンプレート名が指定されていません。")
 
-        template_doc_ref = (
-            db.collection("users")
-            .document(uid)
-            .collection("templates")
-            .document(template_name)
-        )
-        template_doc = template_doc_ref.get()
-        if not template_doc.exists:
+        ref = db.collection("users").document(uid).collection("templates").document(template_name)
+        doc = ref.get()
+        if not doc.exists:
             raise ValueError(f"テンプレート「{template_name}」が見つかりません。")
 
-        data = template_doc.to_dict()
-        spreadsheet_id = data.get("spreadsheetId")
-
+        spreadsheet_id = (doc.to_dict() or {}).get("spreadsheetId")
         return (jsonify({"spreadsheetId": spreadsheet_id}), 200, headers)
 
     except ValueError as e:
