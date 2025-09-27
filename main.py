@@ -146,7 +146,7 @@ def call_gemini_for_row(full_text: str, items: list[str]) -> list[str]:
     )
 
     def _post_and_parse(model: str, prompt_text: str) -> list[str] | None:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
         headers = {"Content-Type": "application/json"}
         payload = {
             "contents": [{"parts": [{"text": prompt_text}]}],
