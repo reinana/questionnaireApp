@@ -134,7 +134,7 @@ def gen_content_with_retry(model, parts, tries: int = 3, timeout_s: int = 60):
             time.sleep(1 * (2 ** i))  # 1s, 2s, 4s
     raise last_err
 
-import json
+
 
 def ocr_pdf_pages_via_gcs(file_bytes: bytes) -> list[str]:
     """PDF→GCS→Vision 非同期OCR。ページごとのテキスト配列を返す。"""
@@ -187,11 +187,67 @@ def ocr_pdf_pages_via_gcs(file_bytes: bytes) -> list[str]:
 
     return pages
 
-def _is_pdf(fname: str, mime: str, head: bytes) -> bool:
-    fname_l = (fname or "").lower().strip()
-    mime_l  = (mime  or "").lower()
-    by_name = bool(re.search(r"\.pdf\s*$", fname_l))
-    return ("pdf" in mime_l) or by_name or head.startswith(b"%PDF-")
+def is_pdf_upload(file_storage) -> bool:
+    mime = (file_storage.mimetype or "").lower()
+    name = (file_storage.filename or "").lower()
+    return ("pdf" in mime) or name.endswith(".pdf")
+
+# PDF のときは bytes を読まず、そのまま GCS にストリーム転送
+def ocr_pdf_pages_via_gcs_stream(file_storage) -> list[str]:
+    """
+    Flaskの FileStorage を受け取り、GCSにストリームでアップロードして Vision OCR。
+    ページごとのテキスト配列を返す。
+    """
+    if not TEMP_BUCKET:
+        raise RuntimeError("TEMP_BUCKET が設定されていません。")
+
+    ts = int(time.time() * 1000)
+    src_name   = f"uploads/{ts}.pdf"
+    out_prefix = f"vision-out/{ts}/"  # 末尾スラッシュ
+
+    bucket = storage_client.bucket(TEMP_BUCKET)
+    src_blob = bucket.blob(src_name)
+
+    # ★ここがポイント：read()しない。ストリームをそのまま渡す
+    src_blob.upload_from_file(file_storage.stream, content_type="application/pdf", rewind=True)
+    print(f"[PDF OCR] uploaded: gs://{TEMP_BUCKET}/{src_name}")
+
+    gcs_src = vision.GcsSource(uri=f"gs://{TEMP_BUCKET}/{src_name}")
+    gcs_dst = vision.GcsDestination(uri=f"gs://{TEMP_BUCKET}/{out_prefix}")
+
+    feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
+    input_config  = vision.InputConfig(gcs_source=gcs_src, mime_type="application/pdf")
+    output_config = vision.OutputConfig(gcs_destination=gcs_dst)
+
+    req = vision.AsyncAnnotateFileRequest(
+        features=[feature], input_config=input_config, output_config=output_config
+    )
+    op = vision_client.async_batch_annotate_files(requests=[req])
+    op.result(timeout=600)
+    print(f"[PDF OCR] async finished. output prefix: gs://{TEMP_BUCKET}/{out_prefix}")
+
+    blobs = list(storage_client.list_blobs(TEMP_BUCKET, prefix=out_prefix))
+    json_blobs = [b for b in blobs if b.name.endswith(".json")]
+    print(f"[PDF OCR] json files: {len(json_blobs)}")
+    if not json_blobs:
+        raise RuntimeError(f"OCR結果(JSON)が見つかりません: gs://{TEMP_BUCKET}/{out_prefix}")
+
+    texts = []
+    for b in json_blobs:
+        data = json.loads(b.download_as_bytes().decode("utf-8"))
+        for r in data.get("responses", []):
+            txt = r.get("fullTextAnnotation", {}).get("text", "")
+            if txt:
+                texts.append(txt)
+
+    if os.environ.get("KEEP_VISION_OUTPUT") != "1":
+        try:
+            src_blob.delete()
+            for b in blobs: b.delete()
+        except Exception as e:
+            print(f"[PDF OCR] cleanup warn: {e}")
+
+    return texts
 
 # ----------------------------------------------------------------
 # 4. Functions
@@ -234,9 +290,11 @@ def analyze_survey_template(request):
         print(f"[ANALYZE] file: {fname} ({mime}), size={len(file_bytes)}")
 
         # --- OCR ---
-        if _is_pdf(fname, mime, file_bytes[:5]):
-            page_texts = ocr_pdf_pages_via_gcs(file_bytes)  # ページごと
+        
+        if "pdf" in mime or fname.endswith(".pdf"):
+            page_texts = ocr_pdf_pages_via_gcs_stream(uploaded_file)   # ← ストリーム版に変更
         else:
+            file_bytes = uploaded_file.read()  # 画像は小さいのでOK
             page_texts = [ocr_image_inline(file_bytes)]
 
         # --- Geminiでページごとに抽出 → 重複除去して集約 ---
@@ -343,10 +401,12 @@ def ocr_and_write_sheet(request):
             mime = (f.mimetype or "").lower()
             fname = (f.filename or "").lower()
             # OCR
-            if mime == "application/pdf" or fname.endswith(".pdf"):
-                raw_text = ocr_pdf_via_gcs(fb)
+            if "pdf" in mime or fname.endswith(".pdf"):
+                page_texts = ocr_pdf_pages_via_gcs_stream(f)  # ← ストリーム版
+                raw_text = "\n".join(page_texts)
             else:
-                raw_text = ocr_image_inline(fb)
+                img_bytes = f.read()
+                raw_text = ocr_image_inline(img_bytes)
 
             # Gemini で回答抽出（CSV 1行）
             model = genai.GenerativeModel("gemini-2.5-flash")
