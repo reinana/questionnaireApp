@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>アンケートOCRアプリ</title>
+  </head>
+  <body>
+    <h1>アンケートOCRアプリ</h1>
+
+    <div id="auth-container">
+      <p id="user-info">ログインしていません</p>
+      <button id="login-button">Googleでログイン</button>
+      <button id="logout-button" style="display: none">ログアウト</button>
+    </div>
+    <hr />
+
+    <div id="main-content" style="display: none">
+      <h3>フェーズ1：アンケートテンプレート作成</h3>
+      <form id="template-form">
+        <div>
+          <label for="template-name-input">テンプレート名:</label>
+          <input type="text" id="template-name-input" required />
+        </div>
+        <div>
+          <label for="sheet-url-input">GoogleスプレッドシートURL:</label>
+          <input type="url" id="sheet-url-input" size="50" required />
+        </div>
+        <div>
+          <label for="template-file-input">見本ファイル (1枚):</label>
+          <input
+            type="file"
+            id="template-file-input"
+            accept="image/*,application/pdf"
+            required
+          />
+        </div>
+        <button type="submit">テンプレート作成</button>
+      </form>
+      <p id="template-status-message"></p>
+      <hr />
+
+      <h3>フェーズ2：データ抽出</h3>
+      <form id="upload-form">
+        <div>
+          <label for="template-select">使用するテンプレート:</label>
+          <select id="template-select" required></select>
+        </div>
+        <div id="sheet-info">
+          <p>このテンプレートのシートID:</p>
+          <p id="current-sheet-id">未選択</p>
+        </div>
+        <div>
+          <label for="file-input">アンケートファイル (複数選択可):</label>
+          <input
+            type="file"
+            id="file-input"
+            accept="image/*,application/pdf"
+            multiple
+            required
+          />
+        </div>
+        <button type="submit">抽出開始</button>
+      </form>
+    </div>
+
+    <p id="status-message"></p>
+
+    <script src="config.js"></script>
+    <script type="module" src="script.js"></script>
+  </body>
+</html>
