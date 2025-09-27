@@ -130,8 +130,7 @@ def call_gemini_for_row(full_text: str, items: list[str]) -> list[str]:
         return []
 
     MODELS = [
-        "gemini-1.5-pro",
-        "gemini-1.5-flash",
+        "gemini-2.5-pro"
     ]
 
     CHUNK = 8
