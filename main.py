@@ -1,7 +1,7 @@
 # ----------------------------------------------------------------
 # 1. imports
 # ----------------------------------------------------------------
-import os, re, time
+import os, re, time, json
 import functions_framework
 import firebase_admin
 from firebase_admin import auth, firestore
@@ -103,7 +103,7 @@ def ocr_pdf_via_gcs(file_bytes: bytes) -> str:
 
     texts = []
     for b in json_blobs:
-        data = json.loads(b.download_as_bytes())
+        data = json.loads(b.download_as_bytes().decode("utf-8"))
         for r in data.get("responses", []):
             txt = r.get("fullTextAnnotation", {}).get("text", "")
             if txt:
@@ -118,6 +118,80 @@ def ocr_pdf_via_gcs(file_bytes: bytes) -> str:
         print(f"[PDF OCR] cleanup warning: {e}")
 
     return "\n".join(texts).strip()
+
+# 文字数を上限でカット
+def _clamp(s: str, max_chars: int = 20_000) -> str:
+    return s if len(s) <= max_chars else s[:max_chars]
+
+# Gemini呼び出しをリトライ付きで
+def gen_content_with_retry(model, parts, tries: int = 3, timeout_s: int = 60):
+    last_err = None
+    for i in range(tries):
+        try:
+            return model.generate_content(parts, request_options={"timeout": timeout_s})
+        except Exception as e:
+            last_err = e
+            time.sleep(1 * (2 ** i))  # 1s, 2s, 4s
+    raise last_err
+
+import json
+
+def ocr_pdf_pages_via_gcs(file_bytes: bytes) -> list[str]:
+    """PDF→GCS→Vision 非同期OCR。ページごとのテキスト配列を返す。"""
+    if not TEMP_BUCKET:
+        raise RuntimeError("TEMP_BUCKET が設定されていません。")
+
+    ts = int(time.time() * 1000)
+    src_name   = f"uploads/{ts}.pdf"
+    out_prefix = f"vision-out/{ts}/"  # 末尾スラッシュ重要
+
+    bucket = storage_client.bucket(TEMP_BUCKET)
+    src_blob = bucket.blob(src_name)
+    src_blob.upload_from_string(file_bytes, content_type="application/pdf")
+    print(f"[PDF OCR] uploaded: gs://{TEMP_BUCKET}/{src_name}")
+
+    gcs_src = vision.GcsSource(uri=f"gs://{TEMP_BUCKET}/{src_name}")
+    gcs_dst = vision.GcsDestination(uri=f"gs://{TEMP_BUCKET}/{out_prefix}")
+
+    feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
+    input_config  = vision.InputConfig(gcs_source=gcs_src, mime_type="application/pdf")
+    output_config = vision.OutputConfig(gcs_destination=gcs_dst)
+
+    req = vision.AsyncAnnotateFileRequest(
+        features=[feature], input_config=input_config, output_config=output_config
+    )
+    op = vision_client.async_batch_annotate_files(requests=[req])
+    op.result(timeout=600)
+    print(f"[PDF OCR] async finished. output prefix: gs://{TEMP_BUCKET}/{out_prefix}")
+
+    blobs = list(storage_client.list_blobs(TEMP_BUCKET, prefix=out_prefix))
+    json_blobs = [b for b in blobs if b.name.endswith(".json")]
+    print(f"[PDF OCR] json files: {len(json_blobs)}")
+    if not json_blobs:
+        raise RuntimeError(f"OCR結果(JSON)が見つかりません: gs://{TEMP_BUCKET}/{out_prefix}")
+
+    pages: list[str] = []
+    for b in json_blobs:
+        data = json.loads(b.download_as_bytes().decode("utf-8"))
+        for r in data.get("responses", []):
+            txt = r.get("fullTextAnnotation", {}).get("text", "")
+            if txt:
+                pages.append(txt)
+
+    if os.environ.get("KEEP_VISION_OUTPUT") != "1":
+        try:
+            src_blob.delete()
+            for b in blobs: b.delete()
+        except Exception as e:
+            print(f"[PDF OCR] cleanup warn: {e}")
+
+    return pages
+
+def _is_pdf(fname: str, mime: str, head: bytes) -> bool:
+    fname_l = (fname or "").lower().strip()
+    mime_l  = (mime  or "").lower()
+    by_name = bool(re.search(r"\.pdf\s*$", fname_l))
+    return ("pdf" in mime_l) or by_name or head.startswith(b"%PDF-")
 
 # ----------------------------------------------------------------
 # 4. Functions
@@ -155,48 +229,44 @@ def analyze_survey_template(request):
         if not file_bytes:
             raise ValueError("アップロードされたファイルが空でした。")
 
-        mime = (uploaded_file.mimetype or "").lower()
-        fname = (uploaded_file.filename or "").lower()
+        mime  = (uploaded_file.mimetype or "")
+        fname = (uploaded_file.filename or "")
         print(f"[ANALYZE] file: {fname} ({mime}), size={len(file_bytes)}")
 
-        # --- OCR（PDF優先） ---
-        if mime == "application/pdf" or fname.endswith(".pdf"):
-            raw_text = ocr_pdf_via_gcs(file_bytes)
+        # --- OCR ---
+        if _is_pdf(fname, mime, file_bytes[:5]):
+            page_texts = ocr_pdf_pages_via_gcs(file_bytes)  # ページごと
         else:
-            raw_text = ocr_image_inline(file_bytes)
+            page_texts = [ocr_image_inline(file_bytes)]
 
-        if not raw_text:
-            raise ValueError("OCRでテキストを抽出できませんでした。")
-
-        # --- Gemini へ渡すテキストを制限（過大入力での 4xx/5xx 防止）---
-        raw_for_gemini = _clamp(raw_text)
-
+        # --- Geminiでページごとに抽出 → 重複除去して集約 ---
         model = genai.GenerativeModel("gemini-2.5-flash")
-        prompt_for_questions = """
-        あなたはアンケート設計を分析する専門家です。
-        以下のOCRテキストから、回答欄に相当する質問項目のみを抽出してください。
-        出力は改行区切りのリストとしてください。
-        """
-        gresp = model.generate_content([prompt_for_questions, raw_for_gemini])
+        prompt = (
+            "あなたはアンケート設計を分析する専門家です。"
+            "以下のOCRテキストから、回答欄に相当する質問項目のみを抽出し、"
+            "各行1項目、改行区切りのプレーンテキストで出力してください。"
+            "設問番号(例: 問1, Q2, 1.)が付いていれば残してください。"
+        )
 
-        # gresp.text が空の場合のフォールバック
-        prompt_items = ""
-        if getattr(gresp, "text", None):
-            prompt_items = gresp.text.strip()
-        else:
+        items: list[str] = []
+        seen = set()
+        for i, page in enumerate(page_texts, 1):
+            chunk = _clamp(page, 20_000)  # 小さめに
             try:
-                parts = []
-                for cand in getattr(gresp, "candidates", []) or []:
-                    for p in getattr(cand, "content", {}).parts or []:
-                        t = getattr(p, "text", "")
-                        if t:
-                            parts.append(t)
-                prompt_items = "\n".join(parts).strip()
+                g = gen_content_with_retry(model, [prompt, chunk], tries=3, timeout_s=60)
+                text = (getattr(g, "text", "") or "").strip()
             except Exception as e:
-                print(f"[ANALYZE] gemini fallback parse failed: {e}")
-                prompt_items = ""
+                print(f"[ANALYZE] gemini page {i} error: {e}")
+                continue
 
-        # --- 保存 ---
+            for line in (text.splitlines() if text else []):
+                line = line.strip()
+                if line and line not in seen:
+                    seen.add(line)
+                    items.append(line)
+
+        prompt_items = "\n".join(items)
+
         ref = db.collection("users").document(uid).collection("templates").document(template_name)
         ref.set({
             "items": prompt_items,
@@ -209,7 +279,6 @@ def analyze_survey_template(request):
     except ValueError as e:
         return (str(e), 400, headers)
     except Exception as e:
-        # ここで “どの段階で失敗したか” が分かるようにログ出力を増やす
         print(f"[ANALYZE][ERROR] {e}")
         return ("テンプレート作成中にエラーが発生しました。", 500, headers)
 
