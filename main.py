@@ -129,9 +129,6 @@ def call_gemini_for_row(full_text: str, items: list[str]) -> list[str]:
     if not items:
         return []
 
-    import google.generativeai as genai
-
-
     MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"]
     CHUNK = 10
     MAX_OUT = 768
