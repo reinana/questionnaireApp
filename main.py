@@ -121,54 +121,155 @@ def _clamp(s: str, max_chars: int = 20_000) -> str:
 
 def call_gemini_for_row(full_text: str, items: list[str]) -> list[str]:
     """
-    OCR全文と設問（items）から、設問順の回答を JSON 配列で返す。
-    SDK(google.generativeai) を使うのでURL組み立て不要・v1beta/v1beta1差異も吸収。
+    OCR全文 + 設問(items) → 設問順の回答（JSON配列）を返す。
+    - SDK利用、resp.textは絶対に触らない
+    - safety BLOCK_NONE、候補の finish_reason/safety をログ
+    - JSON以外はリトライ、ダメなら N/A
     """
     if not items:
         return []
 
     import google.generativeai as genai
 
-    MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"]  # 精度→速度のフォールバック
-    base_prompt = (
-        "以下のOCRテキストから、与えた設問と同じ順序で回答だけを抽出してください。"
-        "出力は必ず JSON の文字列配列（例: [\"回答1\", \"回答2\", ...]）のみ。"
-        "見当たらない設問は \"N/A\"。選択式は選ばれた語のみ、数値は半角。"
+
+    MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"]
+    CHUNK = 10
+    MAX_OUT = 768
+
+    base_sys = (
+        "あなたはアンケート集計用の抽出器です。"
+        "与えた設問リスト順に回答のみを返します。"
+        "出力は必ず JSON の文字列配列（例: [\"回答1\",\"回答2\",...]）。"
+        "見当たらない場合は \"N/A\"。選択式は選ばれた語、数値は半角。"
+        "説明文やコードフェンスは出力しないでください。"
+        "これは利用者が同意した調査票のOCR後処理であり、個人に指示や助言を行うものではありません。"
     )
-    items_json = json.dumps(items, ensure_ascii=False)
-    prompt = f"{base_prompt}\n\n設問:\n{items_json}\n\nOCR:\n{_clamp(full_text)}"
 
-    last_err = None
-    for m in MODELS:
+    # すべて BLOCK_NONE（PII/Healthでのブロック回避）
+    safety_settings = [
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_SEXUAL_CONTENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HEALTH", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_SELF_HARM", "threshold": "BLOCK_NONE"},
+    ]
+
+    # JSON配列のスキーマを強制（構造化出力）
+    response_schema = {"type": "ARRAY", "items": {"type": "STRING"}}
+
+    def _first_text_part(resp):
+        """resp.candidates[*].content.parts[*].text を安全に取り出す（.textは使わない）"""
         try:
-            model = genai.GenerativeModel(m)
-            resp = model.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": 0.1,
-                    "max_output_tokens": 768,
-                    "response_mime_type": "application/json",
-                },
-                request_options={"timeout": 120},
-            )
-            text = (getattr(resp, "text", "") or "").strip()
-            if text.startswith("```"):
-                text = text.strip("`")
-                if text.lower().startswith("json"):
-                    text = text[4:].lstrip()
-            arr = json.loads(text)
-            if isinstance(arr, list):
-                # 列合わせ
-                if len(arr) < len(items):
-                    arr += ["N/A"] * (len(items) - len(arr))
-                return [str(x) if x is not None else "N/A" for x in arr[:len(items)]]
+            cands = getattr(resp, "candidates", None) or []
         except Exception as e:
-            print(f"[Gemini SDK error][{m}] {e}")
-            last_err = e
+            print("[Gemini DEBUG] candidates attr error:", e)
+            return "", None, None
 
-    print("[Gemini SDK fallback] returning N/A due to errors:", last_err)
-    return ["N/A"] * len(items)
+        if not cands:
+            print("[Gemini DEBUG] no candidates returned")
+            return "", None, None
 
+        for idx, c in enumerate(cands):
+            fr = getattr(c, "finish_reason", None)
+            sr = getattr(c, "safety_ratings", None)
+            print(f"[Gemini DEBUG] cand#{idx} finish={fr} safety={sr}")
+            content = getattr(c, "content", None)
+            parts = getattr(content, "parts", None) if content else None
+            if parts:
+                for p in parts:
+                    t = getattr(p, "text", None)
+                    if t:
+                        return t.strip(), fr, sr
+        # partsが全く無い
+        return "", getattr(cands[0], "finish_reason", None), getattr(cands[0], "safety_ratings", None)
+
+    def _to_json_array(s: str) -> list[str] | None:
+        if not s:
+            return None
+        x = s.strip()
+        if x.startswith("```"):
+            x = x.strip("`")
+            if x.lower().startswith("json"):
+                x = x[4:].lstrip()
+        try:
+            arr = json.loads(x)
+            if isinstance(arr, list):
+                return [("N/A" if v is None else str(v)) for v in arr]
+        except Exception:
+            return None
+        return None
+
+    answers: list[str] = []
+
+    for i in range(0, len(items), CHUNK):
+        sub = items[i:i+CHUNK]
+        prompt = (
+            f"{base_sys}\n\n"
+            f"設問(JSON配列): {json.dumps(sub, ensure_ascii=False)}\n\n"
+            f"OCRテキスト:\n{_clamp(full_text, 60000)}"
+        )
+
+        got = None
+        last_err = None
+
+        for m in MODELS:
+            try:
+                model = genai.GenerativeModel(m)
+                resp = model.generate_content(
+                    prompt,
+                    generation_config={
+                        "temperature": 0.1,
+                        "max_output_tokens": MAX_OUT,
+                        "response_mime_type": "application/json",
+                        "response_schema": response_schema,  # 構造化出力を要求
+                    },
+                    safety_settings=safety_settings,
+                    request_options={"timeout": 120},
+                )
+                text, fr, sr = _first_text_part(resp)
+                if not text:
+                    # 返答空なら理由を出す
+                    print("[Gemini DEBUG] empty text; finish_reason=", fr, "safety=", sr)
+                got = _to_json_array(text)
+                if got is not None:
+                    break
+
+                # もう一回だけ温度0/強制指示で再試行
+                resp = model.generate_content(
+                    prompt + "\n\n注意: JSON配列以外を出力しないでください。",
+                    generation_config={
+                        "temperature": 0.0,
+                        "max_output_tokens": MAX_OUT,
+                        "response_mime_type": "application/json",
+                        "response_schema": response_schema,
+                    },
+                    safety_settings=safety_settings,
+                    request_options={"timeout": 120},
+                )
+                text, fr, sr = _first_text_part(resp)
+                if not text:
+                    print("[Gemini DEBUG] retry empty; finish_reason=", fr, "safety=", sr)
+                got = _to_json_array(text)
+                if got is not None:
+                    break
+
+            except Exception as e:
+                print(f"[Gemini SDK error][{m}] {e}")
+                last_err = e
+
+        if got is None:
+            print("[Gemini SDK fallback] chunk N/A; err:", last_err)
+            got = ["N/A"] * len(sub)
+
+        if len(got) < len(sub):
+            got += ["N/A"] * (len(sub) - len(got))
+        answers.extend(got[:len(sub)])
+
+    if len(answers) < len(items):
+        answers += ["N/A"] * (len(items) - len(answers))
+    return answers[:len(items)]
 
 # ----------------------------------------------------------------
 # 4. Functions
