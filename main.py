@@ -1,7 +1,7 @@
 # ----------------------------------------------------------------
 # 1. imports
 # ----------------------------------------------------------------
-import os, re, time, json
+import os, re, time, json, datetime
 import functions_framework
 import firebase_admin
 from firebase_admin import auth, firestore
@@ -10,8 +10,6 @@ from flask import jsonify
 from google.cloud import vision, storage
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-import requests
 
 # ----------------------------------------------------------------
 # 2. init
@@ -23,23 +21,26 @@ except ValueError:
 
 db = firestore.client()
 
-# Gemini
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+# Env
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+TEMP_BUCKET = os.environ.get("TEMP_BUCKET", "")
+GOOGLE_SHEETS_SA_JSON = os.environ.get("GOOGLE_SHEETS_SA_JSON", "")
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 # Vision / Storage
+# （警告を減らしたいなら transport="rest" も可）
 vision_client = vision.ImageAnnotatorClient()
 storage_client = storage.Client()
-TEMP_BUCKET = os.environ.get("TEMP_BUCKET")
 
-# Sheets
-SERVICE_ACCOUNT_FILE = os.environ.get("SHEETS_SA_JSON", "credentials.json")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # ----------------------------------------------------------------
 # 3. utils
 # ----------------------------------------------------------------
 def extract_spreadsheet_id(url: str) -> str:
-    """GoogleスプレッドシートURLからIDを抽出"""
+    """GoogleスプレッドシートURLからIDを抽出（URLでなければそのまま返す）"""
     if not url:
         return ""
     m = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
@@ -59,48 +60,21 @@ def ocr_image_inline(file_bytes: bytes) -> str:
     img = vision.Image(content=file_bytes)
     resp = vision_client.document_text_detection(image=img)
     if resp.error.message:
-        print(f"[VisionError] {resp.error.message}")
         raise RuntimeError(f"Vision API error: {resp.error.message}")
     return (resp.full_text_annotation.text or "").strip()
-def sanitize_ocr_text(t: str) -> str:
-    if not t:
-        return ""
-    # 説明文を落として「問1/Q1」からに切る
-    m = re.search(r'(?:問|Q)\s*0*1[\.\s）)]?', t)
-    if m:
-        t = t[m.start():]
 
-    # “性別” など安全判定のトリガになりやすい語を無害化
-    # （回答語はそのままなので抽出は影響最小）
-    replace_map = {
-        "性別": "ジェンダー",
-        "性　別": "ジェンダー",
-        "性 の 別": "ジェンダー",
-    }
-    for k, v in replace_map.items():
-        t = t.replace(k, v)
-
-    # 記号・空白の正規化
-    trans = str.maketrans({"，": ",", "．": ".", "：": ":", "／": "/", "－": "-"})
-    t = t.translate(trans)
-    t = re.sub(r'[ \t]+', ' ', t)
-    return t.strip()
-
-
-def ocr_pdf_pages_via_gcs_stream(file_storage) -> list[str]:
-    """
-    Flaskの FileStorage を受け取り、GCSにストリームでアップロードして Vision OCR。
-    ページごとのテキスト配列を返す。
-    """
+def ocr_pdf_via_gcs_stream(file_storage) -> str:
+    """PDF→GCS→Vision 非同期OCR。全文テキストを結合して返す。"""
     if not TEMP_BUCKET:
         raise RuntimeError("TEMP_BUCKET が設定されていません。")
 
     ts = int(time.time() * 1000)
     src_name   = f"uploads/{ts}.pdf"
-    out_prefix = f"vision-out/{ts}/"
+    out_prefix = f"vision-out/{ts}/"  # 末尾スラッシュ重要
 
     bucket = storage_client.bucket(TEMP_BUCKET)
     src_blob = bucket.blob(src_name)
+    # read() せずにストリームアップロード（メモリ節約）
     src_blob.upload_from_file(file_storage.stream, content_type="application/pdf", rewind=True)
     print(f"[PDF OCR] uploaded: gs://{TEMP_BUCKET}/{src_name}")
 
@@ -131,122 +105,82 @@ def ocr_pdf_pages_via_gcs_stream(file_storage) -> list[str]:
             if txt:
                 texts.append(txt)
 
-    # cleanup
+    # cleanup（best-effort）
     try:
         src_blob.delete()
-        for b in blobs: b.delete()
+        for b in blobs:
+            b.delete()
     except Exception as e:
         print(f"[PDF OCR] cleanup warn: {e}")
 
-    return texts
+    return "\n".join(texts).strip()
 
-def _clamp(s: str, max_chars: int = 20_000) -> str:
+def _clamp(s: str, max_chars: int = 30_000) -> str:
     return s if len(s) <= max_chars else s[:max_chars]
 
-def call_gemini_for_row(full_text: str, items: list[str]) -> list[str]:
+def get_sheets_service():
+    """SecretのJSON文字列から認証情報を作る（ファイル不要）。"""
+    if not GOOGLE_SHEETS_SA_JSON:
+        raise RuntimeError("GOOGLE_SHEETS_SA_JSON が未設定です。")
+    info = json.loads(GOOGLE_SHEETS_SA_JSON)
+    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    return build("sheets", "v4", credentials=creds)
+
+# --- Gemini ラッパ（設問抽出／回答抽出） ---
+def gemini_extract_questions(ocr_text: str) -> list[str]:
+    """OCRテキストから設問リスト（1行1項目）を抽出。"""
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    prompt = (
+        "あなたはアンケート設計を分析する専門家です。"
+        "以下のOCRテキストから、回答欄に相当する質問項目のみを抽出し、"
+        "各行1項目、改行区切りのプレーンテキストで出力してください。"
+        "設問番号(例: 問1, Q2, 1.)が付いていれば残してください。"
+        "\n\nOCRテキスト:\n" + _clamp(ocr_text)
+    )
+    out = model.generate_content(prompt)
+    text = (getattr(out, "text", "") or "").strip()
+    return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+def gemini_extract_answers_as_array(ocr_text: str, items: list[str]) -> list[str]:
+    """
+    設問配列の順で回答を JSON 配列で返させる。
+    長い説明や余分な語を出さないよう、JSON配列を強制。
+    """
     if not items:
         return []
-    full_text = sanitize_ocr_text(full_text)
-
-    MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"]
-    CHUNK = 6                      # さらに小さく（安全判定を避ける）
-    MAX_OUT = 640
-    URL_TPL = "https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent"
-    headers = {"Content-Type": "application/json", "x-goog-api-key": os.environ.get("GEMINI_API_KEY","")}
-
-    # すべて BLOCK_NONE
-    safety = [
-        {"category":"HARM_CATEGORY_SEXUAL_CONTENT","threshold":"BLOCK_NONE"},
-        {"category":"HARM_CATEGORY_HATE_SPEECH","threshold":"BLOCK_NONE"},
-        {"category":"HARM_CATEGORY_HARASSMENT","threshold":"BLOCK_NONE"},
-        {"category":"HARM_CATEGORY_DANGEROUS_CONTENT","threshold":"BLOCK_NONE"},
-        {"category":"HARM_CATEGORY_CIVIC_INTEGRITY","threshold":"BLOCK_NONE"},
-        {"category":"HARM_CATEGORY_HEALTH","threshold":"BLOCK_NONE"},
-        {"category":"HARM_CATEGORY_SELF_HARM","threshold":"BLOCK_NONE"},
-    ]
-
-    sys = (
-        "あなたはアンケート集計用の抽出器です。"
-        "与えた設問リストの順に回答のみを返します。"
-        "必ず JSON 文字列配列（例: [\"回答1\",\"回答2\",...]）。"
-        "見つからない箇所は \"N/A\"。"
-        "説明文・前置き・コードフェンスを出力しないこと。"
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    prompt = (
+        "あなたはOCRで抽出したアンケート回答を整理するAIです。"
+        "次の質問リスト順に、OCR結果から対応する回答だけを取り出し、"
+        "必ず JSON の文字列配列（例: [\"A\",\"B\",...]）だけを出力してください。"
+        "見つからない箇所は \"N/A\" としてください。"
+        "\n\n質問リスト(JSON配列):\n" + json.dumps(items, ensure_ascii=False) +
+        "\n\nOCR結果:\n" + _clamp(ocr_text, 120_000)
     )
-
-    def parse_first_text(data: dict) -> str:
-        for i, c in enumerate((data or {}).get("candidates") or []):
-            print(f"[Gemini REST] cand#{i} finish={c.get('finishReason')} safety={c.get('safetyRatings')}")
-            for p in ((c.get("content") or {}).get("parts") or []):
-                t = p.get("text")
-                if t:
-                    return t.strip()
-        return ""
-
-    def to_arr(s: str) -> list[str] | None:
-        if not s: return None
-        x = s.strip()
-        if x.startswith("```"):
-            x = x.strip("`")
-            if x.lower().startswith("json"):
-                x = x[4:].lstrip()
+    out = model.generate_content(
+        prompt,
+        generation_config={"response_mime_type": "application/json", "temperature": 0.0, "max_output_tokens": 1024},
+    )
+    txt = (getattr(out, "text", "") or "").strip()
+    try:
+        arr = json.loads(txt)
+        if not isinstance(arr, list):
+            raise ValueError("not list")
+    except Exception:
+        # 再試行（緊急回避）
+        out = model.generate_content(prompt + "\n\n注意: JSON配列以外は出力しないでください。",
+                                     generation_config={"response_mime_type": "application/json", "temperature": 0.0})
+        txt = (getattr(out, "text", "") or "").strip()
         try:
-            j = json.loads(x)
-            if isinstance(j, list):
-                return [("N/A" if v is None else str(v)) for v in j]
+            arr = json.loads(txt)
+            if not isinstance(arr, list):
+                raise ValueError("not list")
         except Exception:
-            return None
-        return None
+            arr = ["N/A"] * len(items)
 
-    ans: list[str] = []
-    for i in range(0, len(items), CHUNK):
-        sub = items[i:i+CHUNK]
-        prompt = (
-            f"{sys}\n\n"
-            f"設問(JSON配列): {json.dumps(sub, ensure_ascii=False)}\n\n"
-            f"OCRテキスト:\n{_clamp(full_text, 30000)}"   # さらに短く
-        )
-        got = None
-        last = None
-        for m in MODELS:
-            url = URL_TPL.format(m=m)
-            body = {
-                "contents":[{"parts":[{"text": prompt}]}],
-                "safetySettings": safety,
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": MAX_OUT,
-                    "responseMimeType": "application/json"
-                }
-            }
-            try:
-                r = requests.post(url, headers=headers, json=body, timeout=120)
-                r.raise_for_status()
-                txt = parse_first_text(r.json())
-                if not txt:
-                    # JSONのみ強制リトライ
-                    body["contents"][0]["parts"][0]["text"] = prompt + "\n\n注意: JSON配列のみを出力してください。"
-                    body["generationConfig"]["temperature"] = 0.0
-                    rr = requests.post(url, headers=headers, json=body, timeout=120)
-                    rr.raise_for_status()
-                    txt = parse_first_text(rr.json())
-                got = to_arr(txt)
-                if got is not None:
-                    break
-            except Exception as e:
-                print(f"[Gemini REST error][{m}] {e}")
-                last = e
-
-        if got is None:
-            print("[Gemini REST fallback] chunk→N/A; err:", last)
-            got = ["N/A"] * len(sub)
-
-        if len(got) < len(sub):
-            got += ["N/A"] * (len(sub) - len(got))
-        ans.extend(got[:len(sub)])
-
-    if len(ans) < len(items):
-        ans += ["N/A"] * (len(items) - len(ans))
-    return ans[:len(items)]
+    if len(arr) < len(items):
+        arr += ["N/A"] * (len(items) - len(arr))
+    return [str(v) if v is not None else "N/A" for v in arr[:len(items)]]
 
 # ----------------------------------------------------------------
 # 4. Functions
@@ -269,34 +203,23 @@ def analyze_survey_template(request):
         spreadsheet_url = (request.form.get("spreadsheet_url") or "").strip()
         uploaded_file = request.files.get("file")
 
-        if not template_name or not spreadsheet_url or not uploaded_file:
-            raise ValueError("必要な入力が不足しています。")
+        if not template_name:
+            raise ValueError("テンプレート名が指定されていません。")
+        if not spreadsheet_url:
+            raise ValueError("スプレッドシートURLが指定されていません。")
+        if not uploaded_file:
+            raise ValueError("ファイルが含まれていません。")
 
         spreadsheet_id = extract_spreadsheet_id(spreadsheet_url)
-        page_texts = (
-            ocr_pdf_pages_via_gcs_stream(uploaded_file)
-            if "pdf" in (uploaded_file.mimetype or "").lower()
-            else [ocr_image_inline(uploaded_file.read())]
-        )
 
-        # Geminiで設問抽出
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        prompt = (
-            "あなたはアンケート設計を分析する専門家です。"
-            "以下のOCRテキストから、回答欄に相当する質問項目のみを抽出し、"
-            "各行1項目、改行区切りで出力してください。"
-        )
+        mime  = (uploaded_file.mimetype or "").lower()
+        fname = (uploaded_file.filename or "")
+        if "pdf" in mime or fname.lower().endswith(".pdf"):
+            raw_text = ocr_pdf_via_gcs_stream(uploaded_file)
+        else:
+            raw_text = ocr_image_inline(uploaded_file.read())
 
-        items: list[str] = []
-        seen = set()
-        for page in page_texts:
-            g = model.generate_content([prompt, _clamp(page)])
-            text = (getattr(g, "text", "") or "").strip()
-            for line in text.splitlines():
-                line = line.strip()
-                if line and line not in seen:
-                    seen.add(line)
-                    items.append(line)
+        items = gemini_extract_questions(raw_text)
 
         ref = db.collection("users").document(uid).collection("templates").document(template_name)
         ref.set({
@@ -307,12 +230,19 @@ def analyze_survey_template(request):
 
         return (f"テンプレート「{template_name}」を作成しました。", 200, headers)
 
+    except ValueError as e:
+        return (str(e), 400, headers)
     except Exception as e:
         print(f"[ANALYZE][ERROR] {e}")
         return ("テンプレート作成中にエラーが発生しました。", 500, headers)
 
 @functions_framework.http
 def ocr_and_write_sheet(request):
+    """
+    テンプレートを使って複数ファイル（PDF/画像）から回答抽出→Sheetsへ書込
+    1行目: ヘッダ（質問項目）
+    2行目以降: 回答
+    """
     headers = {"Access-Control-Allow-Origin": "*"}
     if request.method == "OPTIONS":
         headers.update({
@@ -324,83 +254,74 @@ def ocr_and_write_sheet(request):
 
     try:
         uid = verify_token(request)
+
         template_name = (request.form.get("template_name") or "").strip()
+        if not template_name:
+            raise ValueError("テンプレート名が指定されていません。")
+
         uploaded_files = request.files.getlist("files")
+        if not uploaded_files:
+            raise ValueError("ファイルが含まれていません。")
 
-        if not template_name or not uploaded_files:
-            raise ValueError("必要な入力が不足しています。")
-
-        # テンプレート取得
+        # テンプレート取得（ここから spreadsheetId も取得）
         tref = db.collection("users").document(uid).collection("templates").document(template_name)
         tdoc = tref.get()
         if not tdoc.exists:
-            raise ValueError("テンプレートが見つかりません。")
+            raise ValueError(f"テンプレート「{template_name}」が見つかりません。")
         tdata = tdoc.to_dict()
-
-        print("[RUN] ocr_and_write_sheet start; template=", template_name)
-        print("[RUN] GEMINI KEY exists?", bool(os.environ.get("GEMINI_API_KEY")))
 
         header_row = [q.strip() for q in (tdata.get("items") or "").splitlines() if q.strip()]
         spreadsheet_id = tdata.get("spreadsheetId")
+        if not spreadsheet_id:
+            raise ValueError("テンプレートに紐付いたスプレッドシートIDが存在しません。")
 
-        creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-        sheets = build("sheets", "v4", credentials=creds)
+        sheets = get_sheets_service()
         sheet_api = sheets.spreadsheets().values()
 
-        # ヘッダがなければ書き込む
-        existing = sheet_api.get(spreadsheetId=spreadsheet_id, range="A1:Z1").execute()
-        if "values" not in existing:
-            sheet_api.update(
-                spreadsheetId=spreadsheet_id, range="A1",
-                valueInputOption="RAW", body={"values": [header_row]}
-            ).execute()
+        # 1行目にヘッダ（常に上書き）
+        sheet_api.update(
+            spreadsheetId=spreadsheet_id, range="A1",
+            valueInputOption="RAW", body={"values": [header_row]}
+        ).execute()
 
-        appended, failed = 0, 0
+        rows = []
         for f in uploaded_files:
             try:
                 mime = (f.mimetype or "").lower()
-                fname = (f.filename or "").lower()
-
-                if "pdf" in mime or fname.endswith(".pdf"):
-                    
-                    page_texts = ocr_pdf_pages_via_gcs_stream(f)
-                    raw_text = "\n".join(page_texts)
+                fname = (f.filename or "")
+                if "pdf" in mime or fname.lower().endswith(".pdf"):
+                    raw_text = ocr_pdf_via_gcs_stream(f)
                 else:
                     raw_text = ocr_image_inline(f.read())
 
-                print(f"[DEBUG][OCR] len={len(raw_text)}")
-                print(f"[DEBUG][OCR] head500={raw_text[:500].replace(os.linesep,' ')[:500]}")
-
-                row = call_gemini_for_row(raw_text, header_row)
+                row = gemini_extract_answers_as_array(raw_text, header_row)
+                # 列数合わせ（安全側）
                 if len(row) < len(header_row):
                     row += ["N/A"] * (len(header_row) - len(row))
                 row = row[:len(header_row)]
-
-                # デバッグ: 最初の1行だけ raw を末尾列で出す
-                out_row = row[:]
-                if appended == 0:
-                    try:
-                        out_row.append(f"DEBUG_RAW={json.dumps(row, ensure_ascii=False)[:500]}")
-                    except Exception:
-                        out_row.append("DEBUG_RAW=?")
-                sheet_api.append(
-                    spreadsheetId=spreadsheet_id, range="A2",
-                    valueInputOption="RAW", insertDataOption="INSERT_ROWS",
-                    body={"values": [row]}
-                ).execute()
-                appended += 1
+                rows.append(row)
             except Exception as e:
                 print(f"[Process error] {e}")
-                failed += 1
+                rows.append(["N/A"] * len(header_row))
 
-        return (json.dumps({"ok": True, "appended": appended, "failed": failed}), 200, headers)
+        if rows:
+            sheet_api.append(
+                spreadsheetId=spreadsheet_id, range="A2",
+                valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+                body={"values": rows}
+            ).execute()
 
+        return (f"{len(rows)}件のファイルを処理し、スプレッドシートに書き込みました！", 200, headers)
+
+    except ValueError as e:
+        return (str(e), 400, headers)
     except Exception as e:
         print(f"[WRITE][ERROR] {e}")
         return ("データ抽出中にエラーが発生しました。", 500, headers)
 
 @functions_framework.http
 def get_sheet_id(request):
+    """指定テンプレートに保存してある spreadsheetId を返す（?template=...）"""
     headers = {"Access-Control-Allow-Origin": "*"}
     if request.method == "OPTIONS":
         headers.update({
@@ -413,15 +334,19 @@ def get_sheet_id(request):
     try:
         uid = verify_token(request)
         template_name = request.args.get("template", "").strip()
+        if not template_name:
+            raise ValueError("テンプレート名が指定されていません。")
 
         ref = db.collection("users").document(uid).collection("templates").document(template_name)
         doc = ref.get()
         if not doc.exists:
-            raise ValueError("テンプレートが見つかりません。")
+            raise ValueError(f"テンプレート「{template_name}」が見つかりません。")
 
         spreadsheet_id = (doc.to_dict() or {}).get("spreadsheetId")
         return (jsonify({"spreadsheetId": spreadsheet_id}), 200, headers)
 
+    except ValueError as e:
+        return (str(e), 400, headers)
     except Exception as e:
         print(f"[GET_SHEET_ID][ERROR] {e}")
         return ("シートID取得中にエラーが発生しました。", 500, headers)
