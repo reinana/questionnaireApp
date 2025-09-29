@@ -143,44 +143,138 @@ def gemini_extract_questions(ocr_text: str) -> list[str]:
 
 def gemini_extract_answers_as_array(ocr_text: str, items: list[str]) -> list[str]:
     """
-    設問配列の順で回答を JSON 配列で返させる。
-    長い説明や余分な語を出さないよう、JSON配列を強制。
+    設問ごとに近傍テキスト（contexts）を用意し、LLMには
+    ・contexts（{qid: テキスト}）
+    ・items（[{qid,label}]）
+    を渡して JSON 配列で回答を強制。
     """
     if not items:
         return []
-    model = genai.GenerativeModel("gemini-2.5-flash")
+
+    contexts = build_contexts_for_items(ocr_text, items)
+    items_meta = [{"qid": (extract_qid_from_item(it) or ""), "label": it} for it in items]
+
+    sys = (
+        "あなたはアンケート集計の抽出器です。"
+        "与えた『質問配列』の順に、各質問の回答のみを返してください。"
+        "選択式では番号や丸印（○・●・✓・□等）や '1 男性 2 女性' のような凡例を読み取り、"
+        "該当する『選択肢ラベル』を文字列で返してください。"
+        "数値項目は単位を除いた数値（例: 年齢→'74', 身長→'166.5'）を返してください。"
+        "見つからない箇所は必ず \"N/A\"。"
+        "出力は必ず JSON の『文字列配列』のみ（余計な説明やキーは禁止）。"
+    )
+
     prompt = (
-        "あなたはOCRで抽出したアンケート回答を整理するAIです。"
-        "次の質問リスト順に、OCR結果から対応する回答だけを取り出し、"
-        "必ず JSON の文字列配列（例: [\"A\",\"B\",...]）だけを出力してください。"
-        "見つからない箇所は \"N/A\" としてください。"
-        "\n\n質問リスト(JSON配列):\n" + json.dumps(items, ensure_ascii=False) +
-        "\n\nOCR結果:\n" + _clamp(ocr_text, 120_000)
+        f"{sys}\n\n"
+        f"【コンテキスト辞書(JSON; qid→周辺OCRテキスト)】\n"
+        f"{json.dumps(contexts, ensure_ascii=False)}\n\n"
+        f"【質問配列(JSON; この順に回答を返す)】\n"
+        f"{json.dumps(items_meta, ensure_ascii=False)}\n\n"
+        f"注意:\n"
+        f"- 出力は質問配列と同じ順序の JSON 文字列配列のみ。\n"
+        f"- 回答は可能な限り原文のラベルを用い、番号だけの場合は対応するラベル名に置換してください。\n"
+        f"- マトリクスは該当セルのラベル（例: '週3回' や 'とても満足' 等）を返してください。\n"
     )
-    out = model.generate_content(
-        prompt,
-        generation_config={"response_mime_type": "application/json", "temperature": 0.0, "max_output_tokens": 1024},
-    )
-    txt = (getattr(out, "text", "") or "").strip()
+
+    model = genai.GenerativeModel("gemini-2.5-flash")
     try:
+        out = model.generate_content(
+            prompt,
+            generation_config={
+                "response_mime_type": "application/json",
+                "temperature": 0.0,
+                "max_output_tokens": 2048,
+            },
+        )
+        txt = (getattr(out, "text", "") or "").strip()
         arr = json.loads(txt)
         if not isinstance(arr, list):
             raise ValueError("not list")
-    except Exception:
-        # 再試行（緊急回避）
-        out = model.generate_content(prompt + "\n\n注意: JSON配列以外は出力しないでください。",
-                                     generation_config={"response_mime_type": "application/json", "temperature": 0.0})
-        txt = (getattr(out, "text", "") or "").strip()
+    except Exception as e:
+        print(f"[LLM parse warn] {e} -> fallback Pro")
         try:
+            out = genai.GenerativeModel("gemini-2.5-pro").generate_content(
+                prompt,
+                generation_config={
+                    "response_mime_type": "application/json",
+                    "temperature": 0.0,
+                    "max_output_tokens": 2048,
+                },
+            )
+            txt = (getattr(out, "text", "") or "").strip()
             arr = json.loads(txt)
             if not isinstance(arr, list):
                 raise ValueError("not list")
-        except Exception:
+        except Exception as ee:
+            print(f"[LLM parse fail] {ee}")
             arr = ["N/A"] * len(items)
 
     if len(arr) < len(items):
         arr += ["N/A"] * (len(items) - len(arr))
-    return [str(v) if v is not None else "N/A" for v in arr[:len(items)]]
+    return [("N/A" if v is None else str(v)) for v in arr[:len(items)]]
+
+
+# === 設問ID抽出 & OCR分割（追加） ===================================
+_QID_BLOCK_PAT = re.compile(r'(?:^|\n)\s*(?:付問\s*)?(?:問|Q)\s*([0-9]+(?:-[0-9]+)?)\s*[\.．）)]?')
+
+def extract_qid_from_item(item_line: str) -> str | None:
+    """ヘッダ行（テンプレの1行）から設問ID（例: '37', '39-1'）を抜く"""
+    if not item_line: 
+        return None
+    m = re.search(r'(?:付問\s*)?(?:問|Q)\s*([0-9]+(?:-[0-9]+)?)', item_line)
+    return m.group(1) if m else None
+
+def segment_text_by_qid(full_text: str) -> dict[str, str]:
+    """
+    OCR全文を「問XX / QXX」ごとのブロックに分割。
+    戻り値: {'37': '...問37の周辺テキスト...', '39-1': '...'}
+    """
+    if not full_text:
+        return {}
+    matches = list(_QID_BLOCK_PAT.finditer(full_text))
+    blocks: dict[str, str] = {}
+    if not matches:
+        return blocks
+    for i, m in enumerate(matches):
+        qid = m.group(1)                    # '37' or '39-1'
+        start = m.end()
+        end = matches[i+1].start() if i+1 < len(matches) else len(full_text)
+        blocks[qid] = full_text[start:end].strip()
+    return blocks
+
+def build_contexts_for_items(full_text: str, items: list[str]) -> dict[str, str]:
+    """
+    設問ごとの抽出用コンテキスト（周辺OCRテキスト）を作る。
+    1設問あたり最大 ~2000文字にクランプしてサイズ抑制。
+    """
+    blocks = segment_text_by_qid(full_text)
+    ctx: dict[str, str] = {}
+    for it in items:
+        qid = extract_qid_from_item(it)
+        c = ""
+        if qid and qid in blocks:
+            c = blocks[qid]
+        elif qid and '-' in qid:
+            # 付問は親設問のブロックも効くことがある（例: '39-1' → '39'）
+            base = qid.split('-', 1)[0]
+            if base in blocks:
+                c = blocks[base]
+        # キーワード近傍フォールバック（番号が取れない or ブロック無い）
+        if not c:
+            # 漢字/かな/英数の2文字以上をキー候補に
+            words = re.findall(r'[一-龯ぁ-んァ-ヶa-zA-Z0-9]{2,}', it)
+            found = None
+            for w in words[:3]:
+                p = full_text.find(w)
+                if p != -1:
+                    s = max(0, p - 300)
+                    e = min(len(full_text), p + 1200)
+                    found = full_text[s:e]
+                    break
+            c = found or full_text[:1200]
+        ctx[qid or f"idx{len(ctx)}"] = c[:2000]
+    return ctx
+# ==================================================================
 
 # ----------------------------------------------------------------
 # 4. Functions
