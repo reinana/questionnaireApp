@@ -26,6 +26,27 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 TEMP_BUCKET = os.environ.get("TEMP_BUCKET", "")
 GOOGLE_SHEETS_SA_JSON = os.environ.get("GOOGLE_SHEETS_SA_JSON", "")
 
+# ---- Gemini init (APIキー経路を優先) ----
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
+if GEMINI_API_KEY:
+    # SDKは GOOGLE_API_KEY も見るので両方に設定しておく
+    os.environ["GOOGLE_API_KEY"] = GEMINI_API_KEY
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    print("[BOOT] Gemini API key: OK")
+else:
+    # ここでは落とさない。リクエスト処理時に 500 を返す
+    print("[BOOT][WARN] GEMINI_API_KEY/GOOGLE_API_KEY が未設定。Gemini呼び出し時にエラーになります。")
+
+
+# SDKは GOOGLE_API_KEY も見ます。念のため両方に入れておく
+os.environ["GOOGLE_API_KEY"] = GEMINI_API_KEY
+
+import google.generativeai as genai
+genai.configure(api_key=GEMINI_API_KEY)
+
+print(f"[BOOT] Gemini API key detected? {'yes' if bool(GEMINI_API_KEY) else 'no'}")
+
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
@@ -312,6 +333,9 @@ def analyze_survey_template(request):
             raw_text = ocr_pdf_via_gcs_stream(uploaded_file)
         else:
             raw_text = ocr_image_inline(uploaded_file.read())
+        
+        if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+            return ("サーバのGemini APIキーが未設定です。管理者に連絡してください。", 500, headers)
 
         items = gemini_extract_questions(raw_text)
 
@@ -356,7 +380,10 @@ def ocr_and_write_sheet(request):
         uploaded_files = request.files.getlist("files")
         if not uploaded_files:
             raise ValueError("ファイルが含まれていません。")
-
+        
+        if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+            return ("サーバのGemini APIキーが未設定です。管理者に連絡してください。", 500, headers)
+        
         # テンプレート取得（ここから spreadsheetId も取得）
         tref = db.collection("users").document(uid).collection("templates").document(template_name)
         tdoc = tref.get()
